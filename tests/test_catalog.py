@@ -1,0 +1,281 @@
+import gc
+import sqlite3
+import warnings
+
+import pytest
+
+from librarian_lib import IndexRecord, Link, SelfCatalog
+
+
+@pytest.fixture
+def catalog(tmp_path):
+    return SelfCatalog(
+        db_path=tmp_path / "self_catalog.db",
+        source="developer",
+        owner_agent="developer-primary",
+    )
+
+
+def make_record(**overrides):
+    base = dict(
+        project="khonliang",
+        source="developer",
+        record_id="fr_deadbeef",
+        schema_version=1,
+        kind="fr",
+        facets={"status": "open", "priority": "high"},
+        text="A feature request about catalog federation.",
+        ref={"skill": "get_fr", "args": {"fr_id": "fr_deadbeef"}},
+    )
+    base.update(overrides)
+    return IndexRecord(**base)
+
+
+class TestRoundtrip:
+    def test_upsert_get_roundtrip(self, catalog):
+        rec = make_record()
+        catalog.upsert(rec)
+        got = catalog.get("khonliang", "fr_deadbeef")
+        assert got is not None
+        assert got.project == "khonliang"
+        assert got.kind == "fr"
+        assert got.facets == {"status": "open", "priority": "high"}
+        assert got.ref == {"skill": "get_fr", "args": {"fr_id": "fr_deadbeef"}}
+        assert got.updated_at > 0  # stamped when absent
+
+    def test_upsert_replaces(self, catalog):
+        catalog.upsert(make_record())
+        catalog.upsert(make_record(facets={"status": "closed"}, text="updated text"))
+        got = catalog.get("khonliang", "fr_deadbeef")
+        assert got.facets == {"status": "closed"}
+        assert got.text == "updated text"
+        assert catalog.stats("khonliang")["total"] == 1
+
+    def test_delete(self, catalog):
+        catalog.upsert(make_record())
+        assert catalog.delete("khonliang", "fr_deadbeef") is True
+        assert catalog.get("khonliang", "fr_deadbeef") is None
+        assert catalog.delete("khonliang", "fr_deadbeef") is False
+
+    def test_get_missing_returns_none(self, catalog):
+        assert catalog.get("khonliang", "nope") is None
+
+    def test_source_mismatch_rejected(self, catalog):
+        with pytest.raises(ValueError, match="source"):
+            catalog.upsert(make_record(source="researcher"))
+
+
+class TestUpsertEnrichment:
+    def test_auto_mentions_from_text(self, catalog):
+        result = catalog.upsert(
+            make_record(text="Fixes bug_a29646ac, follows fr_developer_6ecd0c01 and PR #34.")
+        )
+        assert result["mentions"] == ["bug_a29646ac", "fr_developer_6ecd0c01", "PR #34"]
+        got = catalog.get("khonliang", "fr_deadbeef")
+        assert got.mentions == ["bug_a29646ac", "fr_developer_6ecd0c01", "PR #34"]
+
+    def test_explicit_mentions_not_overwritten(self, catalog):
+        catalog.upsert(
+            make_record(text="mentions fr_aabbccdd", mentions=["custom_mention"])
+        )
+        assert catalog.get("khonliang", "fr_deadbeef").mentions == ["custom_mention"]
+
+    def test_unknown_link_rel_flagged(self, catalog):
+        result = catalog.upsert(
+            make_record(
+                links=[
+                    Link(rel="fixes", target_source="developer", target_id="bug_11112222"),
+                    Link(rel="riffs_on", target_source="researcher", target_id="x"),
+                ]
+            )
+        )
+        assert result["unknown_rels"] == ["riffs_on"]
+        got = catalog.get("khonliang", "fr_deadbeef")
+        assert [link.unknown_rel for link in got.links] == [False, True]
+
+    def test_upsert_resets_embedding_status(self, catalog):
+        catalog.upsert(make_record())
+        assert catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+        catalog.upsert(make_record(text="changed — needs re-embedding"))
+        assert catalog.stats("khonliang")["pending_embeddings"] == 1
+
+
+class TestProjectIsolation:
+    def test_default_scope_isolates_projects(self, catalog):
+        catalog.upsert(make_record(project="proj_a", record_id="r1"))
+        catalog.upsert(make_record(project="proj_b", record_id="r2"))
+        res = catalog.query("proj_a")
+        assert res["count"] == 1
+        assert res["rows"][0]["record_id"] == "r1"
+        # a project-B record never leaks into a project-A read
+        assert all(r["project"] == "proj_a" for r in res["rows"])
+
+    def test_get_and_delete_are_project_scoped(self, catalog):
+        catalog.upsert(make_record(project="proj_a", record_id="r1"))
+        assert catalog.get("proj_b", "r1") is None
+        assert catalog.delete("proj_b", "r1") is False
+        assert catalog.get("proj_a", "r1") is not None
+
+    def test_all_projects_opt_in(self, catalog):
+        catalog.upsert(make_record(project="proj_a", record_id="r1"))
+        catalog.upsert(make_record(project="proj_b", record_id="r2"))
+        res = catalog.query("proj_a", scope="all_projects")
+        assert res["count"] == 2
+
+    def test_bad_scope_rejected(self, catalog):
+        with pytest.raises(ValueError, match="scope"):
+            catalog.query("proj_a", scope="everything")
+
+
+class TestQuery:
+    @pytest.fixture(autouse=True)
+    def seed(self, catalog):
+        catalog.upsert(
+            make_record(record_id="fr_1", kind="fr",
+                        facets={"status": "open", "priority": "high"}, updated_at=100.0)
+        )
+        catalog.upsert(
+            make_record(record_id="fr_2", kind="fr",
+                        facets={"status": "closed"}, updated_at=200.0)
+        )
+        catalog.upsert(
+            make_record(record_id="bug_1", kind="bug",
+                        facets={"status": "open", "custom": "x"}, updated_at=300.0)
+        )
+
+    def test_filter_by_kind(self, catalog):
+        res = catalog.query("khonliang", filters={"kind": "bug"})
+        assert res["count"] == 1
+        assert res["rows"][0]["record_id"] == "bug_1"
+
+    def test_filter_by_facet(self, catalog):
+        res = catalog.query("khonliang", filters={"status": "open"})
+        assert {r["record_id"] for r in res["rows"]} == {"fr_1", "bug_1"}
+
+    def test_filter_by_extension_facet(self, catalog):
+        res = catalog.query("khonliang", filters={"custom": "x"})
+        assert res["count"] == 1
+
+    def test_date_filters(self, catalog):
+        res = catalog.query(
+            "khonliang", filters={"updated_after": 150.0, "updated_before": 250.0}
+        )
+        assert [r["record_id"] for r in res["rows"]] == ["fr_2"]
+
+    def test_jmespath_filter(self, catalog):
+        res = catalog.query(
+            "khonliang", jmespath_expr="[?facets.status=='open' && kind=='fr']"
+        )
+        assert res["count"] == 1
+        assert res["rows"][0]["record_id"] == "fr_1"
+
+    def test_jmespath_no_match_returns_empty(self, catalog):
+        res = catalog.query("khonliang", jmespath_expr="[?kind=='nope']")
+        assert res == {"count": 0, "rows": []}
+
+    def test_projection(self, catalog):
+        res = catalog.query(
+            "khonliang", filters={"kind": "bug"}, fields=["record_id", "kind"]
+        )
+        assert res["rows"] == [{"record_id": "bug_1", "kind": "bug"}]
+
+    def test_limit(self, catalog):
+        res = catalog.query("khonliang", limit=2)
+        assert res["count"] == 2
+        # ordered newest-first
+        assert [r["record_id"] for r in res["rows"]] == ["bug_1", "fr_2"]
+
+
+class TestSearchAndSync:
+    def test_text_fallback_mode_without_vector(self, catalog):
+        catalog.upsert(make_record(record_id="r1", text="catalog federation design"))
+        catalog.upsert(make_record(record_id="r2", text="unrelated inference tuning"))
+        res = catalog.search("khonliang", "Catalog Federation")
+        assert res["mode"] == "text_fallback"
+        assert res["count"] == 1
+        assert res["rows"][0]["record_id"] == "r1"
+
+    def test_search_scoped_to_project(self, catalog):
+        catalog.upsert(make_record(project="proj_a", record_id="r1", text="same words"))
+        catalog.upsert(make_record(project="proj_b", record_id="r2", text="same words"))
+        res = catalog.search("proj_a", "same words")
+        assert [r["project"] for r in res["rows"]] == ["proj_a"]
+
+    def test_list_since(self, catalog):
+        catalog.upsert(make_record(record_id="r1", updated_at=100.0))
+        catalog.upsert(make_record(record_id="r2", updated_at=200.0))
+        catalog.upsert(make_record(record_id="r3", updated_at=300.0))
+        res = catalog.list_since("khonliang", 150.0)
+        assert [r["record_id"] for r in res["rows"]] == ["r2", "r3"]  # oldest first
+
+    def test_stats(self, catalog):
+        catalog.upsert(make_record(record_id="fr_1", kind="fr", facets={"status": "open"}))
+        catalog.upsert(
+            make_record(record_id="dog_1", kind="dogfood",
+                        facets={"status": "open", "needs_curation": True})
+        )
+        stats = catalog.stats("khonliang")
+        assert stats["total"] == 2
+        assert stats["by_kind"] == {"fr": 1, "dogfood": 1}
+        assert stats["by_status"] == {"open": 2}
+        assert stats["pending_embeddings"] == 2
+        assert stats["needs_curation"] == 1
+        assert stats["by_spec_version"] == {"0": 2}
+
+    def test_stats_all_projects(self, catalog):
+        catalog.upsert(make_record(project="proj_a", record_id="r1"))
+        catalog.upsert(make_record(project="proj_b", record_id="r2"))
+        assert catalog.stats()["total"] == 2
+        assert catalog.stats("proj_a")["total"] == 1
+
+
+class TestEmbeddingBacklog:
+    def test_pending_then_store(self, catalog):
+        catalog.upsert(make_record(record_id="r1", text="embed me"))
+        pending = catalog.pending_embeddings()
+        assert pending == [
+            {"project": "khonliang", "record_id": "r1", "text": "embed me"}
+        ]
+        assert catalog.store_embedding("khonliang", "r1", b"\x01\x02", "test-model") is True
+        assert catalog.pending_embeddings() == []
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+
+    def test_store_embedding_missing_row(self, catalog):
+        assert catalog.store_embedding("khonliang", "ghost", b"\x00", "m") is False
+
+
+class TestConnectionHygiene:
+    def test_no_resource_warning_across_operations(self, tmp_path):
+        # ResourceWarning is escalated to an error by pytest.ini; this test
+        # additionally forces collection so an unclosed connection surfaces
+        # here rather than at interpreter shutdown.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ResourceWarning)
+            catalog = SelfCatalog(
+                db_path=tmp_path / "hygiene.db",
+                source="developer",
+                owner_agent="developer-primary",
+            )
+            catalog.upsert(make_record())
+            catalog.get("khonliang", "fr_deadbeef")
+            catalog.query("khonliang", filters={"kind": "fr"})
+            catalog.search("khonliang", "catalog")
+            catalog.stats("khonliang")
+            catalog.list_since("khonliang", 0.0)
+            catalog.pending_embeddings()
+            catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00", "m")
+            catalog.delete("khonliang", "fr_deadbeef")
+            del catalog
+            gc.collect()
+
+    def test_connection_closed_even_on_error(self, tmp_path):
+        catalog = SelfCatalog(
+            db_path=tmp_path / "err.db", source="developer", owner_agent="dev"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ResourceWarning)
+            with pytest.raises(sqlite3.Error):
+                with catalog._connect() as conn:
+                    conn.execute("SELECT * FROM no_such_table")
+            gc.collect()
