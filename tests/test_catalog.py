@@ -396,3 +396,24 @@ class TestReviewRound5Fixes:
         )
         with pytest.raises(ValueError, match="JSON-serializable"):
             catalog.upsert(rec)
+
+
+class TestEmbeddedCountFailureDegrades:
+    def test_embedded_count_failure_degrades_to_text_fallback(self, tmp_path, monkeypatch):
+        pytest.importorskip("sqlite_vec")
+        from librarian_lib import IndexRecord, SelfCatalog
+
+        catalog = SelfCatalog(db_path=tmp_path / "e8.db", source="s", owner_agent="a")
+        catalog.upsert(IndexRecord(
+            project="khonliang", source="s", record_id="r1", schema_version=1,
+            kind="fr", text="findable text", updated_at=1.0,
+        ))
+
+        def boom(self, project):
+            raise RuntimeError("count query failed")
+
+        monkeypatch.setattr(SelfCatalog, "_embedded_count", boom)
+        res = catalog.search("khonliang", "findable", query_vector=b"\x00" * 12)
+        assert res["mode"] == "text_fallback"
+        assert res["count"] == 1
+        assert "vector_error" in res

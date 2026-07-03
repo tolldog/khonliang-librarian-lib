@@ -336,14 +336,21 @@ class SelfCatalog:
 
         Returns:
             ``{"mode": "vector" | "text_fallback", "count": int, "rows": [...]}``
-            with a ``distance`` key per row in vector mode.
+            with a ``distance`` key per row in vector mode. When a vector
+            attempt fails and falls back to text, the response also
+            carries ``vector_error`` (the exception, stringified).
         """
-        if _HAS_SQLITE_VEC and query_vector is not None and self._embedded_count(project) > 0:
+        if _HAS_SQLITE_VEC and query_vector is not None:
             try:
-                return self._vector_search(project, query_vector, limit)
-            except sqlite3.Error as exc:
-                # Extension load / query failure must degrade per the
-                # documented contract, not raise; the reason is surfaced.
+                # _embedded_count is INSIDE the try too: a failing count
+                # query (sqlite error, I/O issue) must degrade like any
+                # other vector-path failure, never raise past this method.
+                if self._embedded_count(project) > 0:
+                    return self._vector_search(project, query_vector, limit)
+            except Exception as exc:  # noqa: BLE001 — fallback path: any
+                # vector failure (sqlite errors, extension load OSError,
+                # sqlite_vec API changes) must degrade, never raise. The
+                # reason is surfaced via vector_error for observability.
                 out = self._text_search(project, query_text, limit)
                 out["vector_error"] = str(exc)
                 return out
