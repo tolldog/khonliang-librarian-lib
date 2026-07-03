@@ -3,9 +3,10 @@
 The transport is injected: the owner agent passes a ``fetch_fn`` callable
 (typically a closure over its bus client) that returns CatalogSpec JSON.
 This library never imports khonliang-bus-lib. When the fetch is absent or
-fails, the client degrades to :data:`DEFAULT_SPEC` and sets
-``degraded=True`` so callers can surface it — bootstrap must never block
-on the librarian being up.
+fails, the client sets ``degraded=True`` and keeps the last known-good
+cached spec when one exists; only with no prior cache does it bootstrap
+on :data:`DEFAULT_SPEC` — bootstrap must never block on the librarian
+being up, and a transient outage must never regress a good spec.
 """
 
 from __future__ import annotations
@@ -31,11 +32,13 @@ class SpecClient:
         self._cached: Optional[CatalogSpec] = None
 
     def get_spec(self, refresh: bool = False) -> CatalogSpec:
-        """Return the active spec, degrading to ``DEFAULT_SPEC`` on failure.
+        """Return the active spec, degrading gracefully on failure.
 
-        The result is cached; pass ``refresh=True`` to re-fetch (e.g. after
-        the librarian comes back up). ``degraded`` reflects the most recent
-        resolution attempt.
+        On fetch/validation failure ``degraded`` is set True and the last
+        known-good cached spec is kept; ``DEFAULT_SPEC`` is used only when
+        there is no prior cache. The result is cached; pass
+        ``refresh=True`` to re-fetch (e.g. after the librarian comes back
+        up). ``degraded`` reflects the most recent resolution attempt.
         """
         if self._cached is not None and not refresh:
             return self._cached

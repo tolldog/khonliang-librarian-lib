@@ -319,7 +319,7 @@ class SelfCatalog:
     def search(
         self,
         project: str,
-        query_text: str,
+        query_text: Optional[str],
         limit: int = 20,
         query_vector: Optional[bytes] = None,
     ) -> dict[str, Any]:
@@ -378,7 +378,9 @@ class SelfCatalog:
             out.append(d)
         return {"mode": "vector", "count": len(out), "rows": out}
 
-    def _text_search(self, project: str, query_text: str, limit: int) -> dict[str, Any]:
+    def _text_search(
+        self, project: str, query_text: Optional[str], limit: int
+    ) -> dict[str, Any]:
         terms = [t for t in (query_text or "").split() if t]
         if not terms:
             # An empty query matches nothing — search stays search, never

@@ -62,7 +62,7 @@ class CatalogSkills:
     def catalog_search(
         self,
         project: str,
-        query_text: str,
+        query_text: Optional[str],
         limit: int = 20,
         query_vector: Optional[Union[bytes, str]] = None,
     ) -> dict[str, Any]:
