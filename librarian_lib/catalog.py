@@ -102,7 +102,10 @@ class SelfCatalog:
         spec: Optional[CatalogSpec] = None,
     ) -> None:
         self.db_path = str(db_path)
-        if self.db_path == ":memory:" or "mode=memory" in self.db_path:
+        # Only the literal :memory: path is in-memory here: connections are
+        # opened without uri=True, so "file:...mode=memory" strings are
+        # treated by sqlite as ordinary filenames, not URIs.
+        if self.db_path == ":memory:":
             raise ValueError(
                 "in-memory sqlite is unsupported: connections are per-operation, "
                 "so each call would see a fresh empty database — use a file path "

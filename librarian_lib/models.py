@@ -134,7 +134,11 @@ class IndexRecord(BaseModel):
         for key in ("status", "target"):
             if key in v and not isinstance(v[key], str):
                 raise ValueError(f"core facet {key!r} must be a string when present")
-        if "priority" in v and not isinstance(v["priority"], (str, int)):
+        if "priority" in v and (
+            isinstance(v["priority"], bool)
+            or not isinstance(v["priority"], (str, int))
+        ):
+            # bool is a subclass of int — exclude it explicitly.
             raise ValueError("core facet 'priority' must be a string or int when present")
         return v
 

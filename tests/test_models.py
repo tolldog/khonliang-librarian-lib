@@ -124,3 +124,15 @@ class TestSpecAndDescriptor:
         )
         assert d.record_count is None
         assert d.freshness is None
+
+
+def test_priority_facet_rejects_bool():
+    import pytest
+
+    from librarian_lib import IndexRecord
+
+    with pytest.raises(ValueError, match="priority"):
+        IndexRecord(
+            project="p", source="s", record_id="r", schema_version=1,
+            kind="fr", text="", updated_at=1.0, facets={"priority": True},
+        )

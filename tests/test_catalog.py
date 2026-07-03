@@ -292,17 +292,18 @@ class TestMemoryPathRejection:
         with pytest.raises(ValueError, match="in-memory"):
             SelfCatalog(db_path=":memory:", source="s", owner_agent="a")
 
-    def test_uri_memory_mode_rejected(self, tmp_path):
-        import pytest
-
+    def test_mode_memory_substring_path_is_a_literal_file(self, tmp_path):
+        # Without uri=True, sqlite treats "...mode=memory..." strings as
+        # ordinary filenames — they must NOT be rejected (round-6 finding:
+        # the earlier substring guard over-rejected legitimate paths).
         from librarian_lib import SelfCatalog
 
-        with pytest.raises(ValueError, match="in-memory"):
-            SelfCatalog(
-                db_path="file:cat?mode=memory&cache=shared",
-                source="s",
-                owner_agent="a",
-            )
+        cat = SelfCatalog(
+            db_path=tmp_path / "odd mode=memory name.db",
+            source="s",
+            owner_agent="a",
+        )
+        assert cat.stats()["total"] == 0  # persists like any file db
 
 
 class TestReviewRound2Fixes:
