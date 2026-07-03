@@ -70,9 +70,6 @@ class TestSpecClient:
 
 
 def test_fetch_fn_cleared_keeps_last_known_good():
-    from librarian_lib import CatalogSpec
-    from librarian_lib.spec_client import SpecClient
-
     client = SpecClient(fetch_fn=lambda: CatalogSpec(version=9))
     assert client.get_spec().version == 9
     client.fetch_fn = None

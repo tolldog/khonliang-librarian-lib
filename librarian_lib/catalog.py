@@ -341,7 +341,9 @@ class SelfCatalog:
         if _HAS_SQLITE_VEC and query_vector is not None and self._embedded_count(project) > 0:
             try:
                 return self._vector_search(project, query_vector, limit)
-            except sqlite3.Error as exc:
+            except Exception as exc:  # noqa: BLE001 — fallback path: any
+                # vector failure (sqlite errors, extension load OSError,
+                # sqlite_vec API changes) must degrade, never raise.
                 # Extension load / query failure must degrade per the
                 # documented contract, not raise; the reason is surfaced.
                 out = self._text_search(project, query_text, limit)

@@ -127,10 +127,6 @@ class TestSpecAndDescriptor:
 
 
 def test_priority_facet_rejects_bool():
-    import pytest
-
-    from librarian_lib import IndexRecord
-
     with pytest.raises(ValueError, match="priority"):
         IndexRecord(
             project="p", source="s", record_id="r", schema_version=1,
