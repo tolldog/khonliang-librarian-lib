@@ -400,7 +400,6 @@ class TestReviewRound5Fixes:
 
 class TestReviewRound8Fix:
     def test_embedded_count_failure_degrades_to_text_fallback(self, tmp_path, monkeypatch):
-        pytest = __import__("pytest")
         from librarian_lib import IndexRecord, SelfCatalog
 
         catalog = SelfCatalog(db_path=tmp_path / "e8.db", source="s", owner_agent="a")
