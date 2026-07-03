@@ -398,8 +398,9 @@ class TestReviewRound5Fixes:
             catalog.upsert(rec)
 
 
-class TestReviewRound8Fix:
+class TestEmbeddedCountFailureDegrades:
     def test_embedded_count_failure_degrades_to_text_fallback(self, tmp_path, monkeypatch):
+        pytest.importorskip("sqlite_vec")
         from librarian_lib import IndexRecord, SelfCatalog
 
         catalog = SelfCatalog(db_path=tmp_path / "e8.db", source="s", owner_agent="a")
