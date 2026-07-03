@@ -336,7 +336,9 @@ class SelfCatalog:
 
         Returns:
             ``{"mode": "vector" | "text_fallback", "count": int, "rows": [...]}``
-            with a ``distance`` key per row in vector mode.
+            with a ``distance`` key per row in vector mode. When a vector
+            attempt fails and falls back to text, the response also
+            carries ``vector_error`` (the exception, stringified).
         """
         if _HAS_SQLITE_VEC and query_vector is not None:
             try:
