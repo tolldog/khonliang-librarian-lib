@@ -380,3 +380,18 @@ class TestReviewRound3Fixes:
         )
         with pytest.raises(ValueError, match="JSON-serializable"):
             catalog.upsert(rec)
+
+
+class TestReviewRound5Fixes:
+    def test_nan_facet_fails_fast(self, tmp_path):
+        import pytest
+
+        from librarian_lib import IndexRecord, SelfCatalog
+
+        catalog = SelfCatalog(db_path=tmp_path / "n.db", source="s", owner_agent="a")
+        rec = IndexRecord(
+            project="khonliang", source="s", record_id="r1", schema_version=1,
+            kind="fr", text="t", updated_at=1.0, facets={"score": float("nan")},
+        )
+        with pytest.raises(ValueError, match="JSON-serializable"):
+            catalog.upsert(rec)

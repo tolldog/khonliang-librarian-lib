@@ -156,8 +156,8 @@ class SelfCatalog:
         links = validate_links(record.links, self.spec)
         updated_at = record.updated_at or time.time()
         try:
-            facets_json = json.dumps(record.facets)
-            ref_json = json.dumps(record.ref)
+            facets_json = json.dumps(record.facets, allow_nan=False)
+            ref_json = json.dumps(record.ref, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"IndexRecord {record.record_id!r}: facets and ref must be "

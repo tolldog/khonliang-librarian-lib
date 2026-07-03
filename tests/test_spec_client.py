@@ -67,3 +67,15 @@ class TestSpecClient:
         state["up"] = True
         assert client.get_spec(refresh=True).version == 5
         assert client.degraded is False
+
+
+def test_fetch_fn_cleared_keeps_last_known_good():
+    from librarian_lib import CatalogSpec
+    from librarian_lib.spec_client import SpecClient
+
+    client = SpecClient(fetch_fn=lambda: CatalogSpec(version=9))
+    assert client.get_spec().version == 9
+    client.fetch_fn = None
+    spec = client.get_spec(refresh=True)
+    assert spec.version == 9  # last known good kept
+    assert client.degraded is True

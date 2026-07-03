@@ -43,8 +43,10 @@ class SpecClient:
         if self._cached is not None and not refresh:
             return self._cached
         if self.fetch_fn is None:
+            # Same keep-last-known-good semantics as the failure path below.
             self.degraded = True
-            self._cached = DEFAULT_SPEC
+            if self._cached is None:
+                self._cached = DEFAULT_SPEC
             return self._cached
         try:
             payload = self.fetch_fn()
