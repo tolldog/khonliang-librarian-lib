@@ -279,3 +279,25 @@ class TestConnectionHygiene:
                 with catalog._connect() as conn:
                     conn.execute("SELECT * FROM no_such_table")
             gc.collect()
+
+
+class TestMemoryPathRejection:
+    def test_memory_path_rejected_up_front(self, tmp_path):
+        import pytest
+
+        from librarian_lib import SelfCatalog
+
+        with pytest.raises(ValueError, match="in-memory"):
+            SelfCatalog(db_path=":memory:", source="s", owner_agent="a")
+
+    def test_uri_memory_mode_rejected(self, tmp_path):
+        import pytest
+
+        from librarian_lib import SelfCatalog
+
+        with pytest.raises(ValueError, match="in-memory"):
+            SelfCatalog(
+                db_path="file:cat?mode=memory&cache=shared",
+                source="s",
+                owner_agent="a",
+            )

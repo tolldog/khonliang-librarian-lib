@@ -102,6 +102,12 @@ class SelfCatalog:
         spec: Optional[CatalogSpec] = None,
     ) -> None:
         self.db_path = str(db_path)
+        if self.db_path == ":memory:" or "mode=memory" in self.db_path:
+            raise ValueError(
+                "in-memory sqlite is unsupported: connections are per-operation, "
+                "so each call would see a fresh empty database — use a file path "
+                "(e.g. a tmp_path in tests)"
+            )
         self.source = source
         self.owner_agent = owner_agent
         self.spec = spec or DEFAULT_SPEC

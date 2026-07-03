@@ -1,3 +1,8 @@
+import base64
+import struct
+
+import pytest
+
 import librarian_lib
 from librarian_lib import CatalogSkills, IndexRecord, SelfCatalog
 
@@ -42,6 +47,33 @@ class TestCatalogSkills:
         skills = CatalogSkills(make_catalog(tmp_path))
         assert skills.list_since("khonliang", 50.0)["count"] == 1
         assert skills.list_since("khonliang", 150.0)["count"] == 0
+
+    def test_catalog_search_passes_query_vector_bytes(self, tmp_path):
+        pytest.importorskip("sqlite_vec")
+        catalog = make_catalog(tmp_path)
+        vec = struct.pack("3f", 1.0, 0.0, 0.0)
+        catalog.store_embedding("khonliang", "art_00112233", vec, model="test-embed")
+        skills = CatalogSkills(catalog)
+        res = skills.catalog_search("khonliang", "scoresheet", query_vector=vec)
+        assert res["mode"] == "vector"
+        assert res["count"] == 1
+        assert "distance" in res["rows"][0]
+
+    def test_catalog_search_accepts_base64_query_vector(self, tmp_path):
+        pytest.importorskip("sqlite_vec")
+        catalog = make_catalog(tmp_path)
+        vec = struct.pack("3f", 1.0, 0.0, 0.0)
+        catalog.store_embedding("khonliang", "art_00112233", vec, model="test-embed")
+        skills = CatalogSkills(catalog)
+        res = skills.catalog_search(
+            "khonliang", "scoresheet", query_vector=base64.b64encode(vec).decode()
+        )
+        assert res["mode"] == "vector"
+
+    def test_catalog_search_rejects_bad_base64_loudly(self, tmp_path):
+        skills = CatalogSkills(make_catalog(tmp_path))
+        with pytest.raises(ValueError, match="base64"):
+            skills.catalog_search("khonliang", "scoresheet", query_vector="not/valid!!")
 
     def test_skill_methods_have_docstrings(self, tmp_path):
         skills = CatalogSkills(make_catalog(tmp_path))

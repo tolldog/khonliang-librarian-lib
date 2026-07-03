@@ -8,7 +8,9 @@ example.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import base64
+import binascii
+from typing import Any, Optional, Union
 
 from .catalog import SelfCatalog
 
@@ -58,17 +60,38 @@ class CatalogSkills:
         )
 
     def catalog_search(
-        self, project: str, query_text: str, limit: int = 20
+        self,
+        project: str,
+        query_text: str,
+        limit: int = 20,
+        query_vector: Optional[Union[bytes, str]] = None,
     ) -> dict[str, Any]:
         """Similarity search over this owner's index-card text.
 
-        Vector search when embeddings + sqlite-vec are available, text
-        LIKE fallback otherwise; the response reports which via "mode".
+        Vector search when embeddings + sqlite-vec are available AND a
+        ``query_vector`` is supplied (embedding the query text is the
+        caller's / dispatcher's job); text LIKE fallback otherwise. The
+        response reports which via "mode".
+
+        Args:
+            query_vector: raw float32 vector bytes, or the same
+                base64-encoded (bus transports carry JSON, not bytes).
+                A str that is not valid base64 raises ValueError loudly.
 
         Returns:
             {"mode": "vector"|"text_fallback", "count": int, "rows": [...]}
         """
-        return self.catalog.search(project, query_text, limit=limit)
+        vec: Optional[bytes]
+        if isinstance(query_vector, str):
+            try:
+                vec = base64.b64decode(query_vector, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError(
+                    "query_vector string must be base64-encoded vector bytes"
+                ) from exc
+        else:
+            vec = query_vector
+        return self.catalog.search(project, query_text, limit=limit, query_vector=vec)
 
     def catalog_stats(self, project: Optional[str] = None) -> dict[str, Any]:
         """Catalog health counters (by kind/status, spec versions, backlog).
