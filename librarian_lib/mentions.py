@@ -10,12 +10,12 @@ input.
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from .models import DEFAULT_SPEC, CatalogSpec
 
 
-def extract_mentions(text: str, spec: Optional[CatalogSpec] = None) -> list[str]:
+def extract_mentions(text: Any, spec: Optional[CatalogSpec] = None) -> list[str]:
     """Extract ecosystem ids mentioned in ``text``.
 
     Recognizes (with the default spec):

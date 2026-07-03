@@ -274,7 +274,13 @@ class SelfCatalog:
                 params.append(float(value))
             else:
                 # Facet filter. json_extract needs a quoted key path for
-                # keys with odd characters.
+                # keys with odd characters; embedded double-quotes would
+                # produce an invalid path, so reject them loudly.
+                if '"' in key:
+                    raise ValueError(
+                        f"facet filter key {key!r} contains a double-quote — "
+                        "unsupported in json_extract paths"
+                    )
                 where.append('json_extract(facets_json, ?) = ?')
                 params.append(f'$."{key}"')
                 params.append(int(value) if isinstance(value, bool) else value)
@@ -322,7 +328,14 @@ class SelfCatalog:
             with a ``distance`` key per row in vector mode.
         """
         if _HAS_SQLITE_VEC and query_vector is not None and self._embedded_count(project) > 0:
-            return self._vector_search(project, query_vector, limit)
+            try:
+                return self._vector_search(project, query_vector, limit)
+            except sqlite3.Error as exc:
+                # Extension load / query failure must degrade per the
+                # documented contract, not raise; the reason is surfaced.
+                out = self._text_search(project, query_text, limit)
+                out["vector_error"] = str(exc)
+                return out
         return self._text_search(project, query_text, limit)
 
     def _embedded_count(self, project: str) -> int:
@@ -449,30 +462,57 @@ class SelfCatalog:
     # ------------------------------------------------------------------
 
     def pending_embeddings(self, limit: int = 100) -> list[dict[str, Any]]:
-        """Rows awaiting embedding, across all projects (worker-facing)."""
+        """Rows awaiting embedding, across all projects (worker-facing).
+
+        Each row carries ``updated_at`` — pass it back to
+        :meth:`store_embedding` as ``expected_updated_at`` so a vector
+        computed from stale text is never marked ready.
+        """
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT project, record_id, text FROM records "
+                "SELECT project, record_id, text, updated_at FROM records "
                 "WHERE source = ? AND embedding_status = 'pending' "
                 "ORDER BY updated_at ASC LIMIT ?",
                 (self.source, int(limit)),
             ).fetchall()
         return [
-            {"project": r["project"], "record_id": r["record_id"], "text": r["text"]}
+            {
+                "project": r["project"],
+                "record_id": r["record_id"],
+                "text": r["text"],
+                "updated_at": r["updated_at"],
+            }
             for r in rows
         ]
 
     def store_embedding(
-        self, project: str, record_id: str, vector: bytes, model: str
+        self,
+        project: str,
+        record_id: str,
+        vector: bytes,
+        model: str,
+        expected_updated_at: Optional[float] = None,
     ) -> bool:
-        """Attach a vector produced elsewhere; marks the row 'ready'."""
+        """Attach a vector produced elsewhere; marks the row 'ready'.
+
+        Pass ``expected_updated_at`` (from :meth:`pending_embeddings`) to
+        guard against a concurrent upsert: if the record's text changed
+        since the worker read it, the write is skipped (returns False) and
+        the row stays 'pending' for re-embedding. Omitting the guard writes
+        unconditionally — only safe when the caller serializes with the
+        owner's write path.
+        """
+        sql = (
+            "UPDATE records SET embedding = ?, embedding_model = ?, "
+            "embedding_status = 'ready' "
+            "WHERE project = ? AND source = ? AND record_id = ?"
+        )
+        params: list[Any] = [vector, model, project, self.source, record_id]
+        if expected_updated_at is not None:
+            sql += " AND updated_at = ?"
+            params.append(float(expected_updated_at))
         with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE records SET embedding = ?, embedding_model = ?, "
-                "embedding_status = 'ready' "
-                "WHERE project = ? AND source = ? AND record_id = ?",
-                (vector, model, project, self.source, record_id),
-            )
+            cur = conn.execute(sql, params)
             conn.commit()
             return cur.rowcount > 0
 

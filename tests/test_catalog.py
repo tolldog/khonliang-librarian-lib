@@ -234,9 +234,11 @@ class TestEmbeddingBacklog:
     def test_pending_then_store(self, catalog):
         catalog.upsert(make_record(record_id="r1", text="embed me"))
         pending = catalog.pending_embeddings()
-        assert pending == [
-            {"project": "khonliang", "record_id": "r1", "text": "embed me"}
-        ]
+        assert len(pending) == 1
+        assert pending[0]["project"] == "khonliang"
+        assert pending[0]["record_id"] == "r1"
+        assert pending[0]["text"] == "embed me"
+        assert "updated_at" in pending[0]
         assert catalog.store_embedding("khonliang", "r1", b"\x01\x02", "test-model") is True
         assert catalog.pending_embeddings() == []
         assert catalog.stats("khonliang")["pending_embeddings"] == 0
@@ -301,3 +303,53 @@ class TestMemoryPathRejection:
                 source="s",
                 owner_agent="a",
             )
+
+
+class TestReviewRound2Fixes:
+    def test_facet_key_with_quote_rejected(self, tmp_path):
+        import pytest
+
+        from librarian_lib import SelfCatalog
+
+        catalog = SelfCatalog(db_path=tmp_path / "q.db", source="s", owner_agent="a")
+        with pytest.raises(ValueError, match="double-quote"):
+            catalog.query("khonliang", filters={'bad"key': 1})
+
+    def test_store_embedding_guard_skips_stale_row(self, tmp_path):
+        from librarian_lib import IndexRecord, SelfCatalog
+
+        catalog = SelfCatalog(db_path=tmp_path / "g.db", source="s", owner_agent="a")
+        rec = IndexRecord(
+            project="khonliang", source="s", record_id="r1", schema_version=1,
+            kind="fr", text="v1 text", updated_at=100.0,
+        )
+        catalog.upsert(rec)
+        pending = catalog.pending_embeddings()
+        assert pending[0]["updated_at"] == 100.0
+        # concurrent upsert bumps updated_at before the worker writes back
+        catalog.upsert(rec.model_copy(update={"text": "v2 text", "updated_at": 200.0}))
+        ok = catalog.store_embedding(
+            "khonliang", "r1", b"\x00\x00\x80?", model="m",
+            expected_updated_at=pending[0]["updated_at"],
+        )
+        assert ok is False
+        assert catalog.pending_embeddings()[0]["record_id"] == "r1"  # still pending
+
+    def test_spec_client_keeps_last_known_good_on_refresh_failure(self):
+        from librarian_lib import CatalogSpec
+        from librarian_lib.spec_client import SpecClient
+
+        good = CatalogSpec(version=7)
+        calls = {"n": 0}
+
+        def fetch():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return good
+            raise RuntimeError("librarian down")
+
+        client = SpecClient(fetch_fn=fetch)
+        assert client.get_spec().version == 7
+        spec = client.get_spec(refresh=True)
+        assert spec.version == 7  # last known good kept, not DEFAULT_SPEC
+        assert client.degraded is True

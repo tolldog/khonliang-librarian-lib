@@ -52,7 +52,11 @@ class SpecClient:
             self.degraded = False
             self._cached = spec
         except Exception:
-            # Any transport or validation failure → degraded bootstrap.
+            # Any transport or validation failure → degraded. Keep the last
+            # known-good spec when we have one (a transient librarian outage
+            # must not regress the fleet to DEFAULT_SPEC); only bootstrap on
+            # the default when there is no prior cache.
             self.degraded = True
-            self._cached = DEFAULT_SPEC
+            if self._cached is None:
+                self._cached = DEFAULT_SPEC
         return self._cached
