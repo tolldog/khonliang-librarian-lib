@@ -68,10 +68,11 @@ class CatalogSkills:
     ) -> dict[str, Any]:
         """Similarity search over this owner's index-card text.
 
-        Vector search when embeddings + sqlite-vec are available AND a
-        ``query_vector`` is supplied (embedding the query text is the
-        caller's / dispatcher's job); text LIKE fallback otherwise. The
-        response reports which via "mode".
+        Vector search requires ALL of: sqlite-vec importable, a
+        ``query_vector`` supplied (embedding the query text is the
+        caller's / dispatcher's job), and embedded rows existing for the
+        project — otherwise text LIKE fallback. The response reports
+        which via "mode".
 
         Args:
             query_vector: raw float32 vector bytes, or the same

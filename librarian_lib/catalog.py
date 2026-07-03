@@ -155,6 +155,14 @@ class SelfCatalog:
         mentions = record.mentions or extract_mentions(record.text, self.spec)
         links = validate_links(record.links, self.spec)
         updated_at = record.updated_at or time.time()
+        try:
+            facets_json = json.dumps(record.facets)
+            ref_json = json.dumps(record.ref)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"IndexRecord {record.record_id!r}: facets and ref must be "
+                f"JSON-serializable ({exc})"
+            ) from exc
         with self._connect() as conn:
             conn.execute(
                 """
@@ -184,11 +192,11 @@ class SelfCatalog:
                     record.record_id,
                     record.schema_version,
                     record.kind,
-                    json.dumps(record.facets),
+                    facets_json,
                     record.text,
                     json.dumps([link.model_dump() for link in links]),
                     json.dumps(mentions),
-                    json.dumps(record.ref),
+                    ref_json,
                     updated_at,
                     self.spec.version,
                 ),
@@ -372,6 +380,10 @@ class SelfCatalog:
 
     def _text_search(self, project: str, query_text: str, limit: int) -> dict[str, Any]:
         terms = [t for t in (query_text or "").split() if t]
+        if not terms:
+            # An empty query matches nothing — search stays search, never
+            # a listing endpoint (use query()/list_since() for listings).
+            return {"mode": "text_fallback", "count": 0, "rows": []}
         where = ["project = ?", "source = ?"]
         params: list[Any] = [project, self.source]
         for term in terms:

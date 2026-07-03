@@ -353,3 +353,30 @@ class TestReviewRound2Fixes:
         spec = client.get_spec(refresh=True)
         assert spec.version == 7  # last known good kept, not DEFAULT_SPEC
         assert client.degraded is True
+
+
+class TestReviewRound3Fixes:
+    def test_empty_query_text_matches_nothing(self, tmp_path):
+        from librarian_lib import IndexRecord, SelfCatalog
+
+        catalog = SelfCatalog(db_path=tmp_path / "e.db", source="s", owner_agent="a")
+        catalog.upsert(IndexRecord(
+            project="khonliang", source="s", record_id="r1", schema_version=1,
+            kind="fr", text="some text", updated_at=1.0,
+        ))
+        for q in ("", "   ", None):
+            res = catalog.search("khonliang", q)
+            assert res["count"] == 0 and res["rows"] == []
+
+    def test_non_json_serializable_facets_fail_fast(self, tmp_path):
+        import pytest
+
+        from librarian_lib import IndexRecord, SelfCatalog
+
+        catalog = SelfCatalog(db_path=tmp_path / "j.db", source="s", owner_agent="a")
+        rec = IndexRecord(
+            project="khonliang", source="s", record_id="r1", schema_version=1,
+            kind="fr", text="t", updated_at=1.0, facets={"bad": {1, 2}},
+        )
+        with pytest.raises(ValueError, match="JSON-serializable"):
+            catalog.upsert(rec)
