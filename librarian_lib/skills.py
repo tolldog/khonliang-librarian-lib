@@ -112,3 +112,17 @@ class CatalogSkills:
             {"count": int, "rows": [...]}
         """
         return self.catalog.list_since(project, since_ts, limit=limit)
+
+    def catalog_mark_stale(self, project: str, spec_version: int) -> dict[str, Any]:
+        """Bulk-flag this source's records pending re-embedding after a spec bump.
+
+        Call from the owner agent's own bus reactor when it observes the
+        ecosystem's catalog-spec publish event — this library does not
+        subscribe to that event itself (no transport dependency).
+
+        Returns:
+            {"updated": int}
+        """
+        return {
+            "updated": self.catalog.mark_stale_for_spec_bump(project, spec_version)
+        }

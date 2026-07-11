@@ -101,6 +101,62 @@ class TestUpsertEnrichment:
         assert catalog.stats("khonliang")["pending_embeddings"] == 1
 
 
+def _embedding_status(catalog, project, record_id):
+    rows = catalog.query(project, filters={"record_id": record_id})["rows"]
+    return rows[0]["embedding_status"]
+
+
+class TestMarkStaleForSpecBump:
+    def test_marks_ready_rows_pending_and_stamps_version(self, catalog):
+        catalog.upsert(make_record())
+        catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+
+        updated = catalog.mark_stale_for_spec_bump("khonliang", spec_version=2)
+
+        assert updated == 1
+        stats = catalog.stats("khonliang")
+        assert stats["pending_embeddings"] == 1
+        assert stats["by_spec_version"] == {"2": 1}
+        assert _embedding_status(catalog, "khonliang", "fr_deadbeef") == "pending"
+
+    def test_noop_when_already_on_spec_version(self, catalog):
+        catalog.upsert(make_record())
+        catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
+        assert catalog.mark_stale_for_spec_bump("khonliang", spec_version=0) == 0
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+
+    def test_project_scoped(self, catalog):
+        catalog.upsert(make_record(project="khonliang", record_id="a"))
+        catalog.upsert(make_record(project="other", record_id="b"))
+        catalog.store_embedding("khonliang", "a", b"\x00" * 8, "m")
+        catalog.store_embedding("other", "b", b"\x00" * 8, "m")
+
+        updated = catalog.mark_stale_for_spec_bump("khonliang", spec_version=2)
+
+        assert updated == 1
+        assert _embedding_status(catalog, "khonliang", "a") == "pending"
+        assert _embedding_status(catalog, "other", "b") == "ready"
+
+    def test_source_scoped(self, tmp_path):
+        dev = SelfCatalog(
+            db_path=tmp_path / "shared.db", source="developer", owner_agent="developer-primary"
+        )
+        researcher = SelfCatalog(
+            db_path=tmp_path / "shared.db", source="researcher", owner_agent="researcher-primary"
+        )
+        dev.upsert(make_record())
+        researcher.upsert(make_record(source="researcher"))
+        dev.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
+        researcher.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
+
+        updated = dev.mark_stale_for_spec_bump("khonliang", spec_version=2)
+
+        assert updated == 1
+        assert _embedding_status(dev, "khonliang", "fr_deadbeef") == "pending"
+        assert _embedding_status(researcher, "khonliang", "fr_deadbeef") == "ready"
+
+
 class TestProjectIsolation:
     def test_default_scope_isolates_projects(self, catalog):
         catalog.upsert(make_record(project="proj_a", record_id="r1"))

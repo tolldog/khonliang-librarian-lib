@@ -233,6 +233,36 @@ class SelfCatalog:
             return None
         return _row_to_record(row)
 
+    def mark_stale_for_spec_bump(self, project: str, spec_version: int) -> int:
+        """Bulk-flag this source's records as pending re-embedding.
+
+        Sets every row of this source (in ``project``) still stamped with
+        an older ``spec_version`` to ``embedding_status='pending'`` and
+        clears its stored embedding, then stamps ``spec_version`` to the
+        new value.
+
+        This is the primitive the "spec bump -> re-embed" trigger needs;
+        the reaction itself — subscribing to the ecosystem's catalog-spec
+        publish event — is the owner agent's job in its own repo, since
+        this library has no transport dependency (see ``spec_client.py``).
+        Call this from that reactor once a new spec version is observed.
+
+        Returns:
+            Number of rows updated.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE records
+                SET spec_version = ?, embedding_status = 'pending',
+                    embedding = NULL, embedding_model = NULL
+                WHERE project = ? AND source = ? AND spec_version != ?
+                """,
+                (spec_version, project, self.source, spec_version),
+            )
+            conn.commit()
+            return cur.rowcount
+
     # ------------------------------------------------------------------
     # read path (federated by the librarian)
     # ------------------------------------------------------------------

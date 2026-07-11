@@ -37,8 +37,10 @@ agent, not here.
 - `SelfCatalog` — the sqlite sidecar: upsert/delete/get, structured
   `query` (facet filters + optional jmespath + projection), `search`
   (sqlite-vec vector search when available, text LIKE fallback otherwise),
-  `stats`, `list_since`, and the embedding backlog
-  (`pending_embeddings` / `store_embedding`) (`catalog.py`).
+  `stats`, `list_since`, the embedding backlog
+  (`pending_embeddings` / `store_embedding`), and
+  `mark_stale_for_spec_bump` — the bulk "spec bump -> re-embed" primitive
+  (`catalog.py`).
 - `SpecClient` — fetches the ecosystem `CatalogSpec` via an injected
   callable; degrades to `DEFAULT_SPEC` when the fetch is absent or fails
   (`spec_client.py`).
@@ -99,6 +101,20 @@ skills = CatalogSkills(catalog)
 The librarian then calls `catalog_query` / `catalog_search` / `list_since`
 on each owner to federate, and follows `ref` back to the owner for full
 payloads.
+
+### Reacting to a `CatalogSpec` version bump
+
+This library has no bus dependency, so it does not subscribe to the
+ecosystem's catalog-spec publish event itself. When the owner agent's own
+bus reactor observes that event, it should call `mark_stale_for_spec_bump`
+(exposed as the `catalog_mark_stale` skill) to bulk-flag that project's
+existing rows `embedding_status='pending'` under the new spec version, so
+the dispatcher picks them up for re-embedding:
+
+```python
+def on_catalog_spec_published(event):
+    catalog.mark_stale_for_spec_bump(event["project"], event["spec_version"])
+```
 
 ## Optional vector search
 
