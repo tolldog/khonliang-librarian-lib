@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS records (
     embedding_status TEXT NOT NULL DEFAULT 'pending',
     embedding        BLOB,
     embedding_model  TEXT,
+    embedding_token  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project, source, record_id)
 );
 CREATE INDEX IF NOT EXISTS idx_records_project_kind ON records(project, kind);
@@ -256,12 +257,18 @@ class SelfCatalog:
         the new version and validates against the new content instead of
         regressing to the stale cached spec.
 
-        Also bumps ``updated_at`` on every touched row. Without this, an
-        embedding worker already holding an old ``expected_updated_at``
-        from :meth:`pending_embeddings` could still win the
+        Also bumps ``embedding_token`` (not ``updated_at``) on every touched
+        row. Without this, an embedding worker already holding a stale
+        token from :meth:`pending_embeddings` could still win the
         :meth:`store_embedding` concurrency guard after the bump and write
         back a vector computed under the pre-bump spec/model — flipping the
         row to 'ready' with a stale embedding and defeating the trigger.
+        ``embedding_token`` is deliberately a dedicated counter rather than
+        reusing ``updated_at``: this method doesn't touch the record's
+        content, so rewriting its semantic timestamp would turn every spec
+        bump into a synthetic content change, causing false-positive
+        incremental resyncs via :meth:`list_since` and letting a later real
+        edit with an owner-supplied older timestamp be skipped by it.
 
         ``self.spec`` is replaced *before* the bulk ``UPDATE`` runs (not
         after), so there is no window where the database has already been
@@ -287,10 +294,11 @@ class SelfCatalog:
                 """
                 UPDATE records
                 SET spec_version = ?, embedding_status = 'pending',
-                    embedding = NULL, embedding_model = NULL, updated_at = ?
+                    embedding = NULL, embedding_model = NULL,
+                    embedding_token = embedding_token + 1
                 WHERE project = ? AND source = ? AND spec_version < ?
                 """,
-                (spec.version, time.time(), project, self.source, spec.version),
+                (spec.version, project, self.source, spec.version),
             )
             conn.commit()
             return cur.rowcount
@@ -550,13 +558,16 @@ class SelfCatalog:
     def pending_embeddings(self, limit: int = 100) -> list[dict[str, Any]]:
         """Rows awaiting embedding, across all projects (worker-facing).
 
-        Each row carries ``updated_at`` — pass it back to
-        :meth:`store_embedding` as ``expected_updated_at`` so a vector
-        computed from stale text is never marked ready.
+        Each row carries ``updated_at`` and ``embedding_token`` — pass them
+        back to :meth:`store_embedding` as ``expected_updated_at`` /
+        ``expected_embedding_token`` so a vector computed from stale text,
+        or from a since-superseded spec/embedding model, is never marked
+        ready.
         """
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT project, record_id, text, updated_at FROM records "
+                "SELECT project, record_id, text, updated_at, embedding_token "
+                "FROM records "
                 "WHERE source = ? AND embedding_status = 'pending' "
                 "ORDER BY updated_at ASC LIMIT ?",
                 (self.source, int(limit)),
@@ -567,6 +578,7 @@ class SelfCatalog:
                 "record_id": r["record_id"],
                 "text": r["text"],
                 "updated_at": r["updated_at"],
+                "embedding_token": r["embedding_token"],
             }
             for r in rows
         ]
@@ -578,15 +590,25 @@ class SelfCatalog:
         vector: bytes,
         model: str,
         expected_updated_at: Optional[float] = None,
+        expected_embedding_token: Optional[int] = None,
     ) -> bool:
         """Attach a vector produced elsewhere; marks the row 'ready'.
 
         Pass ``expected_updated_at`` (from :meth:`pending_embeddings`) to
         guard against a concurrent upsert: if the record's text changed
         since the worker read it, the write is skipped (returns False) and
-        the row stays 'pending' for re-embedding. Omitting the guard writes
-        unconditionally — only safe when the caller serializes with the
-        owner's write path.
+        the row stays 'pending' for re-embedding.
+
+        Pass ``expected_embedding_token`` (also from :meth:`pending_embeddings`)
+        to guard against a concurrent :meth:`mark_stale_for_spec_bump`: it is
+        a dedicated counter, independent of ``updated_at``, bumped only when
+        the spec changes — so an in-flight worker's stale-spec vector is
+        rejected without falsely aging the record's semantic
+        ``updated_at`` (which :meth:`list_since` relies on for incremental
+        resync).
+
+        Omitting both guards writes unconditionally — only safe when the
+        caller serializes with the owner's write path.
         """
         sql = (
             "UPDATE records SET embedding = ?, embedding_model = ?, "
@@ -597,6 +619,9 @@ class SelfCatalog:
         if expected_updated_at is not None:
             sql += " AND updated_at = ?"
             params.append(float(expected_updated_at))
+        if expected_embedding_token is not None:
+            sql += " AND embedding_token = ?"
+            params.append(int(expected_embedding_token))
         with self._connect() as conn:
             cur = conn.execute(sql, params)
             conn.commit()

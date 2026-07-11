@@ -173,7 +173,7 @@ class TestMarkStaleForSpecBump:
     def test_rejects_in_flight_embedding_computed_before_the_bump(self, catalog):
         catalog.upsert(make_record())
         [pending] = catalog.pending_embeddings()
-        stale_updated_at = pending["updated_at"]
+        stale_token = pending["embedding_token"]
 
         catalog.mark_stale_for_spec_bump("khonliang", make_spec(2))
 
@@ -182,11 +182,25 @@ class TestMarkStaleForSpecBump:
             "fr_deadbeef",
             b"\x00" * 8,
             "old-model",
-            expected_updated_at=stale_updated_at,
+            expected_embedding_token=stale_token,
         )
 
         assert wrote is False
         assert catalog.stats("khonliang")["pending_embeddings"] == 1
+
+    def test_does_not_perturb_updated_at_or_list_since_resync(self, catalog):
+        catalog.upsert(make_record())
+        got_before = catalog.get("khonliang", "fr_deadbeef")
+
+        catalog.mark_stale_for_spec_bump("khonliang", make_spec(2))
+
+        got_after = catalog.get("khonliang", "fr_deadbeef")
+        assert got_after.updated_at == got_before.updated_at
+        # A spec bump alone must not surface as an incremental-resync change.
+        since = catalog.list_since("khonliang", since_ts=got_before.updated_at - 1)
+        assert since["count"] == 1  # present because updated_at predates it...
+        since_after = catalog.list_since("khonliang", since_ts=got_before.updated_at)
+        assert since_after["count"] == 0  # ...but not re-surfaced by the bump itself
 
     def test_project_scoped(self, catalog):
         catalog.upsert(make_record(project="khonliang", record_id="a"))

@@ -114,12 +114,16 @@ It takes the **full** new `CatalogSpec` (or its dict form), not just the
 version number — stamping the version alone would decouple it from the
 spec content it names, so `upsert()` could start writing rows tagged with
 the new version while still validating against old rel vocabulary/facet
-rules. It also bumps `updated_at` on every touched row (so an embedding
-worker already holding a stale `expected_updated_at` can't win
+rules. It also bumps a dedicated `embedding_token` counter (not
+`updated_at`) on every touched row, so an embedding worker already
+holding a stale token from `pending_embeddings` can't win
 `store_embedding`'s concurrency guard and write back a vector computed
-under the old spec) and replaces `catalog.spec` in place when the new
-version is newer, so a record re-saved right after the bump is stamped
-and validated under the new spec instead of the stale cached one:
+under the old spec — `updated_at` itself is left untouched since it's
+also `list_since`'s incremental-resync cursor, and rewriting it would
+turn every spec bump into a synthetic content change for every row. It
+also replaces `catalog.spec` in place (before the bulk update runs) when
+the new version is newer, so a record re-saved right after the bump is
+stamped and validated under the new spec instead of the stale cached one:
 
 ```python
 def on_catalog_spec_published(event):
