@@ -126,6 +126,17 @@ class TestMarkStaleForSpecBump:
         assert catalog.mark_stale_for_spec_bump("khonliang", spec_version=0) == 0
         assert catalog.stats("khonliang")["pending_embeddings"] == 0
 
+    def test_does_not_downgrade_rows_already_on_a_newer_version(self, catalog):
+        catalog.upsert(make_record())
+        catalog.mark_stale_for_spec_bump("khonliang", spec_version=5)
+        catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
+
+        updated = catalog.mark_stale_for_spec_bump("khonliang", spec_version=2)
+
+        assert updated == 0
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+        assert catalog.stats("khonliang")["by_spec_version"] == {"5": 1}
+
     def test_project_scoped(self, catalog):
         catalog.upsert(make_record(project="khonliang", record_id="a"))
         catalog.upsert(make_record(project="other", record_id="b"))

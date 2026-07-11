@@ -256,7 +256,7 @@ class SelfCatalog:
                 UPDATE records
                 SET spec_version = ?, embedding_status = 'pending',
                     embedding = NULL, embedding_model = NULL
-                WHERE project = ? AND source = ? AND spec_version != ?
+                WHERE project = ? AND source = ? AND spec_version < ?
                 """,
                 (spec_version, project, self.source, spec_version),
             )
