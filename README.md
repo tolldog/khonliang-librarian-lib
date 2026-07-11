@@ -109,7 +109,10 @@ ecosystem's catalog-spec publish event itself. When the owner agent's own
 bus reactor observes that event, it should call `mark_stale_for_spec_bump`
 (exposed as the `catalog_mark_stale` skill) to bulk-flag that project's
 existing rows `embedding_status='pending'` under the new spec version, so
-the dispatcher picks them up for re-embedding. This also advances
+the dispatcher picks them up for re-embedding. It also bumps `updated_at`
+on every touched row (so an embedding worker already holding a stale
+`expected_updated_at` can't win `store_embedding`'s concurrency guard and
+write back a vector computed under the old spec) and advances
 `catalog.spec.version` in place, so a record re-saved right after the bump
 gets stamped with the new version instead of regressing back to the stale
 cached spec — if the full spec content (facets, rel vocabulary, embedding

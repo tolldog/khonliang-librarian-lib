@@ -243,6 +243,13 @@ class SelfCatalog:
         is newer, so a subsequent ``upsert()`` stamps the new version
         instead of regressing the row back to the stale cached spec.
 
+        Also bumps ``updated_at`` on every touched row. Without this, an
+        embedding worker already holding an old ``expected_updated_at``
+        from :meth:`pending_embeddings` could still win the
+        :meth:`store_embedding` concurrency guard after the bump and write
+        back a vector computed under the pre-bump spec/model — flipping the
+        row to 'ready' with a stale embedding and defeating the trigger.
+
         This is the primitive the "spec bump -> re-embed" trigger needs;
         the reaction itself — subscribing to the ecosystem's catalog-spec
         publish event — is the owner agent's job in its own repo, since
@@ -260,10 +267,10 @@ class SelfCatalog:
                 """
                 UPDATE records
                 SET spec_version = ?, embedding_status = 'pending',
-                    embedding = NULL, embedding_model = NULL
+                    embedding = NULL, embedding_model = NULL, updated_at = ?
                 WHERE project = ? AND source = ? AND spec_version < ?
                 """,
-                (spec_version, project, self.source, spec_version),
+                (spec_version, time.time(), project, self.source, spec_version),
             )
             conn.commit()
             updated = cur.rowcount

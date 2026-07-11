@@ -147,6 +147,24 @@ class TestMarkStaleForSpecBump:
         catalog.upsert(make_record(text="re-saved after the bump"))
         assert catalog.stats("khonliang")["by_spec_version"] == {"3": 1}
 
+    def test_rejects_in_flight_embedding_computed_before_the_bump(self, catalog):
+        catalog.upsert(make_record())
+        [pending] = catalog.pending_embeddings()
+        stale_updated_at = pending["updated_at"]
+
+        catalog.mark_stale_for_spec_bump("khonliang", spec_version=2)
+
+        wrote = catalog.store_embedding(
+            "khonliang",
+            "fr_deadbeef",
+            b"\x00" * 8,
+            "old-model",
+            expected_updated_at=stale_updated_at,
+        )
+
+        assert wrote is False
+        assert catalog.stats("khonliang")["pending_embeddings"] == 1
+
     def test_project_scoped(self, catalog):
         catalog.upsert(make_record(project="khonliang", record_id="a"))
         catalog.upsert(make_record(project="other", record_id="b"))
