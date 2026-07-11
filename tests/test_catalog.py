@@ -137,6 +137,16 @@ class TestMarkStaleForSpecBump:
         assert catalog.stats("khonliang")["pending_embeddings"] == 0
         assert catalog.stats("khonliang")["by_spec_version"] == {"5": 1}
 
+    def test_advances_cached_spec_so_upsert_does_not_regress_version(self, catalog):
+        assert catalog.spec.version == 0
+        catalog.upsert(make_record())
+
+        catalog.mark_stale_for_spec_bump("khonliang", spec_version=3)
+
+        assert catalog.spec.version == 3
+        catalog.upsert(make_record(text="re-saved after the bump"))
+        assert catalog.stats("khonliang")["by_spec_version"] == {"3": 1}
+
     def test_project_scoped(self, catalog):
         catalog.upsert(make_record(project="khonliang", record_id="a"))
         catalog.upsert(make_record(project="other", record_id="b"))

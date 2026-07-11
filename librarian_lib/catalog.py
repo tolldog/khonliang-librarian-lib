@@ -239,13 +239,18 @@ class SelfCatalog:
         Sets every row of this source (in ``project``) still stamped with
         an older ``spec_version`` to ``embedding_status='pending'`` and
         clears its stored embedding, then stamps ``spec_version`` to the
-        new value.
+        new value. Also advances ``self.spec.version`` when ``spec_version``
+        is newer, so a subsequent ``upsert()`` stamps the new version
+        instead of regressing the row back to the stale cached spec.
 
         This is the primitive the "spec bump -> re-embed" trigger needs;
         the reaction itself — subscribing to the ecosystem's catalog-spec
         publish event — is the owner agent's job in its own repo, since
         this library has no transport dependency (see ``spec_client.py``).
         Call this from that reactor once a new spec version is observed.
+        If the full spec (facets, rel vocabulary, embedding model) changed
+        too, the caller should also refresh ``self.spec`` via
+        ``SpecClient(...).get_spec(refresh=True)`` separately.
 
         Returns:
             Number of rows updated.
@@ -261,7 +266,10 @@ class SelfCatalog:
                 (spec_version, project, self.source, spec_version),
             )
             conn.commit()
-            return cur.rowcount
+            updated = cur.rowcount
+        if spec_version > self.spec.version:
+            self.spec = self.spec.model_copy(update={"version": spec_version})
+        return updated
 
     # ------------------------------------------------------------------
     # read path (federated by the librarian)
