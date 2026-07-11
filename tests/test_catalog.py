@@ -4,7 +4,7 @@ import warnings
 
 import pytest
 
-from librarian_lib import IndexRecord, Link, SelfCatalog
+from librarian_lib import CatalogSpec, IndexRecord, Link, SelfCatalog
 
 
 @pytest.fixture
@@ -106,13 +106,17 @@ def _embedding_status(catalog, project, record_id):
     return rows[0]["embedding_status"]
 
 
+def make_spec(version, **overrides):
+    return CatalogSpec(version=version, **overrides)
+
+
 class TestMarkStaleForSpecBump:
     def test_marks_ready_rows_pending_and_stamps_version(self, catalog):
         catalog.upsert(make_record())
         catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
         assert catalog.stats("khonliang")["pending_embeddings"] == 0
 
-        updated = catalog.mark_stale_for_spec_bump("khonliang", spec_version=2)
+        updated = catalog.mark_stale_for_spec_bump("khonliang", make_spec(2))
 
         assert updated == 1
         stats = catalog.stats("khonliang")
@@ -120,18 +124,24 @@ class TestMarkStaleForSpecBump:
         assert stats["by_spec_version"] == {"2": 1}
         assert _embedding_status(catalog, "khonliang", "fr_deadbeef") == "pending"
 
+    def test_accepts_spec_as_plain_dict(self, catalog):
+        catalog.upsert(make_record())
+        updated = catalog.mark_stale_for_spec_bump("khonliang", {"version": 2})
+        assert updated == 1
+        assert catalog.spec.version == 2
+
     def test_noop_when_already_on_spec_version(self, catalog):
         catalog.upsert(make_record())
         catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
-        assert catalog.mark_stale_for_spec_bump("khonliang", spec_version=0) == 0
+        assert catalog.mark_stale_for_spec_bump("khonliang", make_spec(0)) == 0
         assert catalog.stats("khonliang")["pending_embeddings"] == 0
 
     def test_does_not_downgrade_rows_already_on_a_newer_version(self, catalog):
         catalog.upsert(make_record())
-        catalog.mark_stale_for_spec_bump("khonliang", spec_version=5)
+        catalog.mark_stale_for_spec_bump("khonliang", make_spec(5))
         catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
 
-        updated = catalog.mark_stale_for_spec_bump("khonliang", spec_version=2)
+        updated = catalog.mark_stale_for_spec_bump("khonliang", make_spec(2))
 
         assert updated == 0
         assert catalog.stats("khonliang")["pending_embeddings"] == 0
@@ -141,18 +151,31 @@ class TestMarkStaleForSpecBump:
         assert catalog.spec.version == 0
         catalog.upsert(make_record())
 
-        catalog.mark_stale_for_spec_bump("khonliang", spec_version=3)
+        catalog.mark_stale_for_spec_bump("khonliang", make_spec(3))
 
         assert catalog.spec.version == 3
         catalog.upsert(make_record(text="re-saved after the bump"))
         assert catalog.stats("khonliang")["by_spec_version"] == {"3": 1}
+
+    def test_new_spec_content_swaps_in_atomically_with_the_version(self, catalog):
+        new_spec = make_spec(2, rel_vocabulary=["only_this_rel"])
+
+        catalog.mark_stale_for_spec_bump("khonliang", new_spec)
+
+        assert catalog.spec.version == 2
+        assert catalog.spec.rel_vocabulary == ["only_this_rel"]
+
+    def test_does_not_replace_cached_spec_when_version_is_not_newer(self, catalog):
+        original_spec = catalog.spec
+        catalog.mark_stale_for_spec_bump("khonliang", make_spec(0, rel_vocabulary=["other"]))
+        assert catalog.spec is original_spec
 
     def test_rejects_in_flight_embedding_computed_before_the_bump(self, catalog):
         catalog.upsert(make_record())
         [pending] = catalog.pending_embeddings()
         stale_updated_at = pending["updated_at"]
 
-        catalog.mark_stale_for_spec_bump("khonliang", spec_version=2)
+        catalog.mark_stale_for_spec_bump("khonliang", make_spec(2))
 
         wrote = catalog.store_embedding(
             "khonliang",
@@ -171,7 +194,7 @@ class TestMarkStaleForSpecBump:
         catalog.store_embedding("khonliang", "a", b"\x00" * 8, "m")
         catalog.store_embedding("other", "b", b"\x00" * 8, "m")
 
-        updated = catalog.mark_stale_for_spec_bump("khonliang", spec_version=2)
+        updated = catalog.mark_stale_for_spec_bump("khonliang", make_spec(2))
 
         assert updated == 1
         assert _embedding_status(catalog, "khonliang", "a") == "pending"
@@ -189,7 +212,7 @@ class TestMarkStaleForSpecBump:
         dev.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
         researcher.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
 
-        updated = dev.mark_stale_for_spec_bump("khonliang", spec_version=2)
+        updated = dev.mark_stale_for_spec_bump("khonliang", make_spec(2))
 
         assert updated == 1
         assert _embedding_status(dev, "khonliang", "fr_deadbeef") == "pending"

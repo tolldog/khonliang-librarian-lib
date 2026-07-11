@@ -106,22 +106,25 @@ payloads.
 
 This library has no bus dependency, so it does not subscribe to the
 ecosystem's catalog-spec publish event itself. When the owner agent's own
-bus reactor observes that event, it should call `mark_stale_for_spec_bump`
-(exposed as the `catalog_mark_stale` skill) to bulk-flag that project's
-existing rows `embedding_status='pending'` under the new spec version, so
-the dispatcher picks them up for re-embedding. It also bumps `updated_at`
-on every touched row (so an embedding worker already holding a stale
-`expected_updated_at` can't win `store_embedding`'s concurrency guard and
-write back a vector computed under the old spec) and advances
-`catalog.spec.version` in place, so a record re-saved right after the bump
-gets stamped with the new version instead of regressing back to the stale
-cached spec — if the full spec content (facets, rel vocabulary, embedding
-model) changed too, refresh it separately via
-`SpecClient(...).get_spec(refresh=True)`:
+bus reactor observes that event, it should refetch the full spec and call
+`mark_stale_for_spec_bump` (exposed as the `catalog_mark_stale` skill) to
+bulk-flag that project's existing rows `embedding_status='pending'` under
+the new spec version, so the dispatcher picks them up for re-embedding.
+It takes the **full** new `CatalogSpec` (or its dict form), not just the
+version number — stamping the version alone would decouple it from the
+spec content it names, so `upsert()` could start writing rows tagged with
+the new version while still validating against old rel vocabulary/facet
+rules. It also bumps `updated_at` on every touched row (so an embedding
+worker already holding a stale `expected_updated_at` can't win
+`store_embedding`'s concurrency guard and write back a vector computed
+under the old spec) and replaces `catalog.spec` in place when the new
+version is newer, so a record re-saved right after the bump is stamped
+and validated under the new spec instead of the stale cached one:
 
 ```python
 def on_catalog_spec_published(event):
-    catalog.mark_stale_for_spec_bump(event["project"], event["spec_version"])
+    new_spec = spec_client.get_spec(refresh=True)
+    catalog.mark_stale_for_spec_bump(event["project"], new_spec)
 ```
 
 ## Optional vector search

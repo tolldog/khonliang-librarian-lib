@@ -24,7 +24,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, Union
 
 import jmespath
 
@@ -233,15 +233,28 @@ class SelfCatalog:
             return None
         return _row_to_record(row)
 
-    def mark_stale_for_spec_bump(self, project: str, spec_version: int) -> int:
+    def mark_stale_for_spec_bump(
+        self, project: str, spec: Union[CatalogSpec, dict[str, Any]]
+    ) -> int:
         """Bulk-flag this source's records as pending re-embedding.
+
+        Takes the *full* new :class:`CatalogSpec` (or its dict form), not
+        just a version number — this is deliberate: stamping only the
+        version integer would let ``upsert()`` start writing
+        ``spec_version=<new>`` while still validating/extracting mentions
+        against the old cached spec content (rel vocabulary, facet rules,
+        id patterns), permanently mislabeling those rows as current since
+        this method only ever revisits rows with ``spec_version <
+        spec.version``. Passing the full spec makes the version bump and
+        the content swap atomic.
 
         Sets every row of this source (in ``project``) still stamped with
         an older ``spec_version`` to ``embedding_status='pending'`` and
-        clears its stored embedding, then stamps ``spec_version`` to the
-        new value. Also advances ``self.spec.version`` when ``spec_version``
-        is newer, so a subsequent ``upsert()`` stamps the new version
-        instead of regressing the row back to the stale cached spec.
+        clears its stored embedding, then stamps ``spec_version`` to
+        ``spec.version``. Also replaces ``self.spec`` with the new spec
+        (when its version is newer), so a subsequent ``upsert()`` stamps
+        the new version and validates against the new content instead of
+        regressing to the stale cached spec.
 
         Also bumps ``updated_at`` on every touched row. Without this, an
         embedding worker already holding an old ``expected_updated_at``
@@ -254,14 +267,14 @@ class SelfCatalog:
         the reaction itself — subscribing to the ecosystem's catalog-spec
         publish event — is the owner agent's job in its own repo, since
         this library has no transport dependency (see ``spec_client.py``).
-        Call this from that reactor once a new spec version is observed.
-        If the full spec (facets, rel vocabulary, embedding model) changed
-        too, the caller should also refresh ``self.spec`` via
-        ``SpecClient(...).get_spec(refresh=True)`` separately.
+        Call this from that reactor with the new spec once it is observed,
+        e.g. via ``SpecClient(...).get_spec(refresh=True)``.
 
         Returns:
             Number of rows updated.
         """
+        if not isinstance(spec, CatalogSpec):
+            spec = CatalogSpec.model_validate(spec)
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -270,12 +283,12 @@ class SelfCatalog:
                     embedding = NULL, embedding_model = NULL, updated_at = ?
                 WHERE project = ? AND source = ? AND spec_version < ?
                 """,
-                (spec_version, time.time(), project, self.source, spec_version),
+                (spec.version, time.time(), project, self.source, spec.version),
             )
             conn.commit()
             updated = cur.rowcount
-        if spec_version > self.spec.version:
-            self.spec = self.spec.model_copy(update={"version": spec_version})
+        if spec.version > self.spec.version:
+            self.spec = spec
         return updated
 
     # ------------------------------------------------------------------
