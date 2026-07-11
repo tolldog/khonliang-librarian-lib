@@ -263,6 +263,11 @@ class SelfCatalog:
         back a vector computed under the pre-bump spec/model — flipping the
         row to 'ready' with a stale embedding and defeating the trigger.
 
+        ``self.spec`` is replaced *before* the bulk ``UPDATE`` runs (not
+        after), so there is no window where the database has already been
+        bumped but a concurrent ``upsert()`` on this instance still
+        validates/stamps against the old cached spec.
+
         This is the primitive the "spec bump -> re-embed" trigger needs;
         the reaction itself — subscribing to the ecosystem's catalog-spec
         publish event — is the owner agent's job in its own repo, since
@@ -275,6 +280,8 @@ class SelfCatalog:
         """
         if not isinstance(spec, CatalogSpec):
             spec = CatalogSpec.model_validate(spec)
+        if spec.version > self.spec.version:
+            self.spec = spec
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -286,10 +293,7 @@ class SelfCatalog:
                 (spec.version, time.time(), project, self.source, spec.version),
             )
             conn.commit()
-            updated = cur.rowcount
-        if spec.version > self.spec.version:
-            self.spec = spec
-        return updated
+            return cur.rowcount
 
     # ------------------------------------------------------------------
     # read path (federated by the librarian)
