@@ -75,9 +75,23 @@ class TestCatalogSkills:
         with pytest.raises(ValueError, match="base64"):
             skills.catalog_search("khonliang", "scoresheet", query_vector="not/valid!!")
 
+    def test_catalog_mark_stale(self, tmp_path):
+        catalog = make_catalog(tmp_path)
+        catalog.store_embedding("khonliang", "art_00112233", b"\x00" * 8, "m")
+        skills = CatalogSkills(catalog)
+        res = skills.catalog_mark_stale("khonliang", spec={"version": 2})
+        assert res == {"updated": 1}
+        assert skills.catalog_stats("khonliang")["pending_embeddings"] == 1
+
     def test_skill_methods_have_docstrings(self, tmp_path):
         skills = CatalogSkills(make_catalog(tmp_path))
-        for name in ("catalog_query", "catalog_search", "catalog_stats", "list_since"):
+        for name in (
+            "catalog_query",
+            "catalog_search",
+            "catalog_stats",
+            "list_since",
+            "catalog_mark_stale",
+        ):
             assert getattr(skills, name).__doc__
 
 

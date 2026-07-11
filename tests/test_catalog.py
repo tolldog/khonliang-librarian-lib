@@ -4,7 +4,7 @@ import warnings
 
 import pytest
 
-from librarian_lib import IndexRecord, Link, SelfCatalog
+from librarian_lib import CatalogSpec, IndexRecord, Link, SelfCatalog
 
 
 @pytest.fixture
@@ -101,7 +101,177 @@ class TestUpsertEnrichment:
         assert catalog.stats("khonliang")["pending_embeddings"] == 1
 
 
-class TestProjectIsolation:
+def _embedding_status(catalog, project, record_id):
+    rows = catalog.query(project, filters={"record_id": record_id})["rows"]
+    return rows[0]["embedding_status"]
+
+
+def make_spec(version, **overrides):
+    return CatalogSpec(version=version, **overrides)
+
+
+class TestMarkStaleForSpecBump:
+    def test_marks_ready_rows_pending_and_stamps_version(self, catalog):
+        catalog.upsert(make_record())
+        catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+
+        updated = catalog.mark_stale_for_spec_bump("khonliang", make_spec(2))
+
+        assert updated == 1
+        stats = catalog.stats("khonliang")
+        assert stats["pending_embeddings"] == 1
+        assert stats["by_spec_version"] == {"2": 1}
+        assert _embedding_status(catalog, "khonliang", "fr_deadbeef") == "pending"
+
+    def test_accepts_spec_as_plain_dict(self, catalog):
+        catalog.upsert(make_record())
+        updated = catalog.mark_stale_for_spec_bump("khonliang", {"version": 2})
+        assert updated == 1
+        assert catalog.spec.version == 2
+
+    def test_noop_when_already_on_spec_version(self, catalog):
+        catalog.upsert(make_record())
+        catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
+        assert catalog.mark_stale_for_spec_bump("khonliang", make_spec(0)) == 0
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+
+    def test_does_not_downgrade_rows_already_on_a_newer_version(self, catalog):
+        catalog.upsert(make_record())
+        catalog.mark_stale_for_spec_bump("khonliang", make_spec(5))
+        catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
+
+        updated = catalog.mark_stale_for_spec_bump("khonliang", make_spec(2))
+
+        assert updated == 0
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+        assert catalog.stats("khonliang")["by_spec_version"] == {"5": 1}
+
+    def test_advances_cached_spec_so_upsert_does_not_regress_version(self, catalog):
+        assert catalog.spec.version == 0
+        catalog.upsert(make_record())
+
+        catalog.mark_stale_for_spec_bump("khonliang", make_spec(3))
+
+        assert catalog.spec.version == 3
+        catalog.upsert(make_record(text="re-saved after the bump"))
+        assert catalog.stats("khonliang")["by_spec_version"] == {"3": 1}
+
+    def test_new_spec_content_swaps_in_atomically_with_the_version(self, catalog):
+        new_spec = make_spec(2, rel_vocabulary=["only_this_rel"])
+
+        catalog.mark_stale_for_spec_bump("khonliang", new_spec)
+
+        assert catalog.spec.version == 2
+        assert catalog.spec.rel_vocabulary == ["only_this_rel"]
+
+    def test_does_not_replace_cached_spec_when_version_is_not_newer(self, catalog):
+        original_spec = catalog.spec
+        catalog.mark_stale_for_spec_bump("khonliang", make_spec(0, rel_vocabulary=["other"]))
+        assert catalog.spec is original_spec
+
+    def test_rejects_in_flight_embedding_computed_before_the_bump(self, catalog):
+        catalog.upsert(make_record())
+        [pending] = catalog.pending_embeddings()
+        stale_token = pending["embedding_token"]
+
+        catalog.mark_stale_for_spec_bump("khonliang", make_spec(2))
+
+        wrote = catalog.store_embedding(
+            "khonliang",
+            "fr_deadbeef",
+            b"\x00" * 8,
+            "old-model",
+            expected_embedding_token=stale_token,
+        )
+
+        assert wrote is False
+        assert catalog.stats("khonliang")["pending_embeddings"] == 1
+
+    def test_does_not_perturb_updated_at_or_list_since_resync(self, catalog):
+        catalog.upsert(make_record())
+        got_before = catalog.get("khonliang", "fr_deadbeef")
+
+        catalog.mark_stale_for_spec_bump("khonliang", make_spec(2))
+
+        got_after = catalog.get("khonliang", "fr_deadbeef")
+        assert got_after.updated_at == got_before.updated_at
+        # A spec bump alone must not surface as an incremental-resync change.
+        since = catalog.list_since("khonliang", since_ts=got_before.updated_at - 1)
+        assert since["count"] == 1  # present because updated_at predates it...
+        since_after = catalog.list_since("khonliang", since_ts=got_before.updated_at)
+        assert since_after["count"] == 0  # ...but not re-surfaced by the bump itself
+
+    def test_project_scoped(self, catalog):
+        catalog.upsert(make_record(project="khonliang", record_id="a"))
+        catalog.upsert(make_record(project="other", record_id="b"))
+        catalog.store_embedding("khonliang", "a", b"\x00" * 8, "m")
+        catalog.store_embedding("other", "b", b"\x00" * 8, "m")
+
+        updated = catalog.mark_stale_for_spec_bump("khonliang", make_spec(2))
+
+        assert updated == 1
+        assert _embedding_status(catalog, "khonliang", "a") == "pending"
+        assert _embedding_status(catalog, "other", "b") == "ready"
+
+    def test_source_scoped(self, tmp_path):
+        dev = SelfCatalog(
+            db_path=tmp_path / "shared.db", source="developer", owner_agent="developer-primary"
+        )
+        researcher = SelfCatalog(
+            db_path=tmp_path / "shared.db", source="researcher", owner_agent="researcher-primary"
+        )
+        dev.upsert(make_record())
+        researcher.upsert(make_record(source="researcher"))
+        dev.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
+        researcher.store_embedding("khonliang", "fr_deadbeef", b"\x00" * 8, "m")
+
+        updated = dev.mark_stale_for_spec_bump("khonliang", make_spec(2))
+
+        assert updated == 1
+        assert _embedding_status(dev, "khonliang", "fr_deadbeef") == "pending"
+        assert _embedding_status(researcher, "khonliang", "fr_deadbeef") == "ready"
+
+
+class TestSchemaMigration:
+    def test_opens_pre_embedding_token_db_and_backfills_the_column(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        # Simulate a catalog file created before embedding_token existed.
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE records (
+                    project          TEXT NOT NULL,
+                    source           TEXT NOT NULL,
+                    record_id        TEXT NOT NULL,
+                    schema_version   INTEGER NOT NULL,
+                    kind             TEXT NOT NULL,
+                    facets_json      TEXT NOT NULL DEFAULT '{}',
+                    text             TEXT NOT NULL DEFAULT '',
+                    links_json       TEXT NOT NULL DEFAULT '[]',
+                    mentions_json    TEXT NOT NULL DEFAULT '[]',
+                    ref_json         TEXT NOT NULL DEFAULT '{}',
+                    updated_at       REAL NOT NULL,
+                    spec_version     INTEGER NOT NULL,
+                    embedding_status TEXT NOT NULL DEFAULT 'pending',
+                    embedding        BLOB,
+                    embedding_model  TEXT,
+                    PRIMARY KEY (project, source, record_id)
+                );
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        catalog = SelfCatalog(
+            db_path=db_path, source="developer", owner_agent="developer-primary"
+        )
+        catalog.upsert(make_record())
+        assert catalog.mark_stale_for_spec_bump("khonliang", make_spec(2)) == 1
+        [pending] = catalog.pending_embeddings()
+        assert pending["embedding_token"] == 1
     def test_default_scope_isolates_projects(self, catalog):
         catalog.upsert(make_record(project="proj_a", record_id="r1"))
         catalog.upsert(make_record(project="proj_b", record_id="r2"))
