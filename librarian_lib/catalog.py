@@ -120,7 +120,23 @@ class SelfCatalog:
             parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
             conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add columns introduced after a catalog's sqlite file already existed.
+
+        ``CREATE TABLE IF NOT EXISTS`` only creates the schema for a brand
+        new file; it never touches a table that already exists on disk
+        from an older release. Each entry here is idempotent (``PRAGMA
+        table_info`` is checked first) so re-running against an
+        already-migrated file is a no-op.
+        """
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(records)")}
+        if "embedding_token" not in existing:
+            conn.execute(
+                "ALTER TABLE records ADD COLUMN embedding_token INTEGER NOT NULL DEFAULT 0"
+            )
 
     # ------------------------------------------------------------------
     # connection hygiene

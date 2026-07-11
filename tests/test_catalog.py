@@ -233,7 +233,45 @@ class TestMarkStaleForSpecBump:
         assert _embedding_status(researcher, "khonliang", "fr_deadbeef") == "ready"
 
 
-class TestProjectIsolation:
+class TestSchemaMigration:
+    def test_opens_pre_embedding_token_db_and_backfills_the_column(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        # Simulate a catalog file created before embedding_token existed.
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE records (
+                    project          TEXT NOT NULL,
+                    source           TEXT NOT NULL,
+                    record_id        TEXT NOT NULL,
+                    schema_version   INTEGER NOT NULL,
+                    kind             TEXT NOT NULL,
+                    facets_json      TEXT NOT NULL DEFAULT '{}',
+                    text             TEXT NOT NULL DEFAULT '',
+                    links_json       TEXT NOT NULL DEFAULT '[]',
+                    mentions_json    TEXT NOT NULL DEFAULT '[]',
+                    ref_json         TEXT NOT NULL DEFAULT '{}',
+                    updated_at       REAL NOT NULL,
+                    spec_version     INTEGER NOT NULL,
+                    embedding_status TEXT NOT NULL DEFAULT 'pending',
+                    embedding        BLOB,
+                    embedding_model  TEXT,
+                    PRIMARY KEY (project, source, record_id)
+                );
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        catalog = SelfCatalog(
+            db_path=db_path, source="developer", owner_agent="developer-primary"
+        )
+        catalog.upsert(make_record())
+        assert catalog.mark_stale_for_spec_bump("khonliang", make_spec(2)) == 1
+        [pending] = catalog.pending_embeddings()
+        assert pending["embedding_token"] == 1
     def test_default_scope_isolates_projects(self, catalog):
         catalog.upsert(make_record(project="proj_a", record_id="r1"))
         catalog.upsert(make_record(project="proj_b", record_id="r2"))
