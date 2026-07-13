@@ -272,6 +272,66 @@ class TestSchemaMigration:
         assert catalog.mark_stale_for_spec_bump("khonliang", make_spec(2)) == 1
         [pending] = catalog.pending_embeddings()
         assert pending["embedding_token"] == 1
+
+    def test_opens_pre_expiry_columns_db_and_backfills_them(self, tmp_path):
+        db_path = tmp_path / "legacy_pre_expiry.db"
+        # Simulate a catalog file created before expires_at/refresh_operation/
+        # refresh_args_json existed (post embedding_token, pre this FR).
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE records (
+                    project          TEXT NOT NULL,
+                    source           TEXT NOT NULL,
+                    record_id        TEXT NOT NULL,
+                    schema_version   INTEGER NOT NULL,
+                    kind             TEXT NOT NULL,
+                    facets_json      TEXT NOT NULL DEFAULT '{}',
+                    text             TEXT NOT NULL DEFAULT '',
+                    links_json       TEXT NOT NULL DEFAULT '[]',
+                    mentions_json    TEXT NOT NULL DEFAULT '[]',
+                    ref_json         TEXT NOT NULL DEFAULT '{}',
+                    updated_at       REAL NOT NULL,
+                    spec_version     INTEGER NOT NULL,
+                    embedding_status TEXT NOT NULL DEFAULT 'pending',
+                    embedding        BLOB,
+                    embedding_model  TEXT,
+                    embedding_token  INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (project, source, record_id)
+                );
+                INSERT INTO records (
+                    project, source, record_id, schema_version, kind,
+                    updated_at, spec_version
+                ) VALUES ('khonliang', 'developer', 'fr_legacy', 1, 'fr', 1.0, 0);
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Opening a SelfCatalog against this pre-existing file must run the
+        # ALTER TABLE branch (not the CREATE TABLE IF NOT EXISTS path, which
+        # only applies to brand-new files) and backfill the three new
+        # columns as NULL rather than raising or dropping the legacy row.
+        catalog = SelfCatalog(
+            db_path=db_path, source="developer", owner_agent="developer-primary"
+        )
+        got = catalog.get("khonliang", "fr_legacy")
+        assert got is not None
+        assert got.expires_at is None
+        assert got.refresh_operation is None
+        assert got.refresh_args is None
+        assert catalog.list_expiring("khonliang", before=1000.0) == {
+            "count": 0,
+            "rows": [],
+        }
+
+        # And the migrated file accepts new writes using the new columns.
+        catalog.upsert(make_record(record_id="fr_new", expires_at=5.0))
+        res = catalog.list_expiring("khonliang", before=1000.0)
+        assert [r["record_id"] for r in res["rows"]] == ["fr_new"]
+
     def test_default_scope_isolates_projects(self, catalog):
         catalog.upsert(make_record(project="proj_a", record_id="r1"))
         catalog.upsert(make_record(project="proj_b", record_id="r2"))
@@ -357,6 +417,189 @@ class TestQuery:
         assert [r["record_id"] for r in res["rows"]] == ["bug_1", "fr_2"]
 
 
+class TestExpiryScheduler:
+    def test_upsert_preserves_embedding_when_only_expiry_fields_change(self, catalog):
+        # Rescheduling (expires_at/refresh_operation/refresh_args) must not
+        # force a needless re-embed when the embeddable text is unchanged —
+        # embeddings are derived from `text` alone.
+        catalog.upsert(make_record(record_id="r1", text="stable text"))
+        assert catalog.store_embedding("khonliang", "r1", b"\x01\x02", "test-model") is True
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+
+        catalog.upsert(
+            make_record(record_id="r1", text="stable text", expires_at=999.0,
+                        refresh_operation="reembed", refresh_args={"id": "r1"})
+        )
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+        got = catalog.get("khonliang", "r1")
+        assert got.expires_at == 999.0
+        assert got.refresh_operation == "reembed"
+        with catalog._connect() as conn:
+            row = conn.execute(
+                "SELECT embedding, embedding_model, embedding_status FROM records "
+                "WHERE project = ? AND source = ? AND record_id = ?",
+                ("khonliang", "developer", "r1"),
+            ).fetchone()
+        assert row["embedding"] == b"\x01\x02"
+        assert row["embedding_model"] == "test-model"
+        assert row["embedding_status"] == "ready"
+
+    def test_upsert_still_invalidates_embedding_when_text_changes(self, catalog):
+        catalog.upsert(make_record(record_id="r1", text="old text"))
+        catalog.store_embedding("khonliang", "r1", b"\x01\x02", "test-model")
+        catalog.upsert(make_record(record_id="r1", text="new text"))
+        assert catalog.stats("khonliang")["pending_embeddings"] == 1
+        with catalog._connect() as conn:
+            row = conn.execute(
+                "SELECT embedding, embedding_status FROM records "
+                "WHERE project = ? AND source = ? AND record_id = ?",
+                ("khonliang", "developer", "r1"),
+            ).fetchone()
+        assert row["embedding"] is None
+        assert row["embedding_status"] == "pending"
+
+    def test_new_row_always_inserted_pending(self, catalog):
+        catalog.upsert(make_record(record_id="r1"))
+        assert catalog.stats("khonliang")["pending_embeddings"] == 1
+
+    def test_expiry_index_exists(self, catalog):
+        with catalog._connect() as conn:
+            names = {
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
+        assert "idx_records_project_source_expires" in names
+
+    def test_expiry_index_backfilled_on_legacy_db(self, tmp_path):
+        db_path = tmp_path / "legacy_no_index.db"
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE records (
+                    project          TEXT NOT NULL,
+                    source           TEXT NOT NULL,
+                    record_id        TEXT NOT NULL,
+                    schema_version   INTEGER NOT NULL,
+                    kind             TEXT NOT NULL,
+                    facets_json      TEXT NOT NULL DEFAULT '{}',
+                    text             TEXT NOT NULL DEFAULT '',
+                    links_json       TEXT NOT NULL DEFAULT '[]',
+                    mentions_json    TEXT NOT NULL DEFAULT '[]',
+                    ref_json         TEXT NOT NULL DEFAULT '{}',
+                    updated_at       REAL NOT NULL,
+                    spec_version     INTEGER NOT NULL,
+                    embedding_status TEXT NOT NULL DEFAULT 'pending',
+                    embedding        BLOB,
+                    embedding_model  TEXT,
+                    embedding_token  INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (project, source, record_id)
+                );
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        catalog = SelfCatalog(
+            db_path=db_path, source="developer", owner_agent="developer-primary"
+        )
+        with catalog._connect() as conn:
+            names = {
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
+        assert "idx_records_project_source_expires" in names
+
+    def test_upsert_roundtrips_expiry_fields(self, catalog):
+        catalog.upsert(
+            make_record(
+                record_id="r1",
+                expires_at=500.0,
+                refresh_operation="reembed",
+                refresh_args={"id": "r1", "n": 2},
+            )
+        )
+        got = catalog.get("khonliang", "r1")
+        assert got.expires_at == 500.0
+        assert got.refresh_operation == "reembed"
+        assert got.refresh_args == {"id": "r1", "n": 2}
+
+    def test_upsert_roundtrips_flag_only_case(self, catalog):
+        # expires_at set, refresh_operation left None — must round-trip
+        # exactly, not be coerced or dropped.
+        catalog.upsert(make_record(record_id="r1", expires_at=500.0))
+        got = catalog.get("khonliang", "r1")
+        assert got.expires_at == 500.0
+        assert got.refresh_operation is None
+        assert got.refresh_args is None
+
+    def test_upsert_defaults_omitted_fields_to_none(self, catalog):
+        catalog.upsert(make_record(record_id="r1"))
+        got = catalog.get("khonliang", "r1")
+        assert got.expires_at is None
+        assert got.refresh_operation is None
+        assert got.refresh_args is None
+
+    def test_list_expiring_empty_when_nothing_due(self, catalog):
+        catalog.upsert(make_record(record_id="r1"))
+        catalog.upsert(make_record(record_id="r2", expires_at=1000.0))
+        res = catalog.list_expiring("khonliang", before=500.0)
+        assert res == {"count": 0, "rows": []}
+
+    def test_list_expiring_excludes_none_expires_at(self, catalog):
+        catalog.upsert(make_record(record_id="r1"))  # expires_at=None
+        catalog.upsert(make_record(record_id="r2", expires_at=100.0))
+        res = catalog.list_expiring("khonliang", before=1000.0)
+        assert [r["record_id"] for r in res["rows"]] == ["r2"]
+
+    def test_list_expiring_ascending_most_overdue_first(self, catalog):
+        catalog.upsert(make_record(record_id="r1", expires_at=300.0))
+        catalog.upsert(make_record(record_id="r2", expires_at=100.0))
+        catalog.upsert(make_record(record_id="r3", expires_at=200.0))
+        res = catalog.list_expiring("khonliang", before=1000.0)
+        assert [r["record_id"] for r in res["rows"]] == ["r2", "r3", "r1"]
+
+    def test_list_expiring_includes_flag_only_rows(self, catalog):
+        # expires_at set but refresh_operation=None must NOT be dropped.
+        catalog.upsert(make_record(record_id="r1", expires_at=100.0))
+        res = catalog.list_expiring("khonliang", before=1000.0)
+        assert res["count"] == 1
+        assert res["rows"][0]["refresh_operation"] is None
+
+    def test_list_expiring_scoped_to_project(self, catalog):
+        catalog.upsert(make_record(project="proj_a", record_id="r1", expires_at=100.0))
+        catalog.upsert(make_record(project="proj_b", record_id="r2", expires_at=100.0))
+        res = catalog.list_expiring("proj_a", before=1000.0)
+        assert [r["project"] for r in res["rows"]] == ["proj_a"]
+
+    def test_list_expiring_scoped_to_source(self, catalog, tmp_path):
+        other = SelfCatalog(
+            db_path=tmp_path / "other.db", source="researcher", owner_agent="researcher-primary"
+        )
+        catalog.upsert(make_record(record_id="r1", expires_at=100.0))
+        other.upsert(
+            make_record(source="researcher", record_id="r2", expires_at=100.0)
+        )
+        res = catalog.list_expiring("khonliang", before=1000.0)
+        assert [r["record_id"] for r in res["rows"]] == ["r1"]
+
+    def test_list_expiring_boundary_inclusive(self, catalog):
+        catalog.upsert(make_record(record_id="r1", expires_at=100.0))
+        res = catalog.list_expiring("khonliang", before=100.0)
+        assert res["count"] == 1
+
+    def test_list_expiring_respects_limit(self, catalog):
+        for i in range(5):
+            catalog.upsert(make_record(record_id=f"r{i}", expires_at=float(i)))
+        res = catalog.list_expiring("khonliang", before=1000.0, limit=2)
+        assert res["count"] == 2
+        assert [r["record_id"] for r in res["rows"]] == ["r0", "r1"]
+
+
 class TestSearchAndSync:
     def test_text_fallback_mode_without_vector(self, catalog):
         catalog.upsert(make_record(record_id="r1", text="catalog federation design"))
@@ -435,6 +678,7 @@ class TestConnectionHygiene:
             catalog.search("khonliang", "catalog")
             catalog.stats("khonliang")
             catalog.list_since("khonliang", 0.0)
+            catalog.list_expiring("khonliang", 0.0)
             catalog.pending_embeddings()
             catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00", "m")
             catalog.delete("khonliang", "fr_deadbeef")

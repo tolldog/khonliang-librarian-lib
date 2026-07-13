@@ -11,6 +11,7 @@ All models are pydantic v2. Design rules enforced here:
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -115,6 +116,39 @@ class IndexRecord(BaseModel):
     links: list[Link] = Field(default_factory=list)
     mentions: list[str] = Field(default_factory=list)
     ref: dict[str, Any] = Field(default_factory=dict)
+    #: Absolute epoch seconds after which this record should be flagged
+    #: (deliberately absolute, not a relative ttl_seconds — the owner
+    #: computes the instant at write time, so a later change to some
+    #: global default TTL can never reinterpret an already-written row).
+    #: None = never flagged. Independent of refresh_operation: a record
+    #: may set expires_at with refresh_operation left None (flag-only,
+    #: no auto-refresh call) — that combination is valid, not an error.
+    expires_at: Optional[float] = None
+    #: Bus skill name on the OWNING agent (this catalog's owner_agent)
+    #: that the librarian should call to refresh this record once it is
+    #: expired. Opaque to this library — never validated against a real
+    #: skill registry here; interpretation is entirely the librarian's
+    #: and the owner's problem.
+    refresh_operation: Optional[str] = None
+    #: JSON-serializable args to pass to refresh_operation. Must be a
+    #: dict when present, values may nest, same rigor already applied to
+    #: facets/ref (JSON-serializability, not flatness).
+    refresh_args: Optional[dict[str, Any]] = None
+
+    @field_validator("refresh_args")
+    @classmethod
+    def _refresh_args_json_serializable(
+        cls, v: Optional[dict[str, Any]]
+    ) -> Optional[dict[str, Any]]:
+        if v is None:
+            return v
+        try:
+            json.dumps(v, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"refresh_args must be a JSON-serializable dict ({exc})"
+            ) from exc
+        return v
 
     @field_validator("project")
     @classmethod

@@ -37,10 +37,10 @@ agent, not here.
 - `SelfCatalog` — the sqlite sidecar: upsert/delete/get, structured
   `query` (facet filters + optional jmespath + projection), `search`
   (sqlite-vec vector search when available, text LIKE fallback otherwise),
-  `stats`, `list_since`, the embedding backlog
-  (`pending_embeddings` / `store_embedding`), and
-  `mark_stale_for_spec_bump` — the bulk "spec bump -> re-embed" primitive
-  (`catalog.py`).
+  `stats`, `list_since`, `list_expiring` (the generic per-record refresh
+  scheduler), the embedding backlog (`pending_embeddings` /
+  `store_embedding`), and `mark_stale_for_spec_bump` — the bulk "spec bump
+  -> re-embed" primitive (`catalog.py`).
 - `SpecClient` — fetches the ecosystem `CatalogSpec` via an injected
   callable; degrades to `DEFAULT_SPEC` when the fetch is absent or fails
   (`spec_client.py`).
@@ -130,6 +130,53 @@ def on_catalog_spec_published(event):
     new_spec = spec_client.get_spec(refresh=True)
     catalog.mark_stale_for_spec_bump(event["project"], new_spec)
 ```
+
+### Generic per-record refresh scheduling
+
+Any owner agent can flag one of its own `IndexRecord`s as due for
+attention by stamping three optional fields at `upsert` time:
+
+- `expires_at` — **absolute** epoch seconds (not a relative
+  `ttl_seconds`). Deliberately absolute: the owner computes the instant
+  once, at write time, so a later change to some global default TTL can
+  never reinterpret an already-written row. `None` (the default) means
+  never flagged.
+- `refresh_operation` — the bus skill name on the record's own
+  `owner_agent` that the librarian should call to refresh it. Opaque to
+  this library — never validated against a real skill registry here;
+  interpretation is entirely the librarian's and the owner's problem.
+- `refresh_args` — JSON-serializable args to pass to that call.
+
+A record may set `expires_at` while leaving `refresh_operation` unset —
+that is a valid "flag only, no auto-refresh" case (e.g. a human-curation
+nudge with no automated callback), not an error, and it is never dropped
+from `list_expiring` / `catalog_list_expiring` results.
+
+```python
+catalog.upsert(IndexRecord(
+    project="khonliang",
+    source="developer",
+    record_id=fr.id,
+    schema_version=1,
+    kind="fr",
+    text=f"{fr.title}\n{fr.description}",
+    ref={"skill": "get_fr", "args": {"fr_id": fr.id}},
+    expires_at=time.time() + 86400 * 30,      # re-check in 30 days
+    refresh_operation="get_fr",                # re-fetch via this skill
+    refresh_args={"fr_id": fr.id},
+))
+```
+
+The librarian polls each owner's `catalog_list_expiring(project, before,
+limit=100)` skill (bus wrapper for `SelfCatalog.list_expiring`) to find
+rows whose `expires_at <= before`, ordered most-overdue-first, and drives
+whatever refresh policy it wants (calling `refresh_operation` on the
+owner, or just surfacing the flag). This library never interprets what
+"refresh" means, never triggers anything on a schedule, and keeps no
+sweep/cooldown bookkeeping — that lives in the librarian's own registry.
+`catalog_list_expiring`'s name, args, and `{"count", "rows"}` response
+shape are a fixed contract with the librarian agent's own expiry-sweep
+skill; do not reshape it in a way that breaks that caller.
 
 ## Optional vector search
 

@@ -75,6 +75,31 @@ class TestCatalogSkills:
         with pytest.raises(ValueError, match="base64"):
             skills.catalog_search("khonliang", "scoresheet", query_vector="not/valid!!")
 
+    def test_catalog_list_expiring(self, tmp_path):
+        catalog = make_catalog(tmp_path)
+        catalog.upsert(
+            IndexRecord(
+                project="khonliang",
+                source="store",
+                record_id="art_expiring",
+                schema_version=1,
+                kind="artifact",
+                text="due for refresh",
+                expires_at=50.0,
+                refresh_operation="artifact_refresh",
+                refresh_args={"artifact_id": "art_expiring"},
+                updated_at=100.0,
+            )
+        )
+        skills = CatalogSkills(catalog)
+        res = skills.catalog_list_expiring("khonliang", before=1000.0)
+        assert res["count"] == 1
+        row = res["rows"][0]
+        assert row["record_id"] == "art_expiring"
+        assert row["refresh_operation"] == "artifact_refresh"
+        assert row["refresh_args"] == {"artifact_id": "art_expiring"}
+        assert skills.catalog_list_expiring("khonliang", before=10.0)["count"] == 0
+
     def test_catalog_mark_stale(self, tmp_path):
         catalog = make_catalog(tmp_path)
         catalog.store_embedding("khonliang", "art_00112233", b"\x00" * 8, "m")
@@ -90,6 +115,7 @@ class TestCatalogSkills:
             "catalog_search",
             "catalog_stats",
             "list_since",
+            "catalog_list_expiring",
             "catalog_mark_stale",
         ):
             assert getattr(skills, name).__doc__

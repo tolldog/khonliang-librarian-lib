@@ -126,6 +126,37 @@ class TestSpecAndDescriptor:
         assert d.freshness is None
 
 
+class TestExpiryScheduler:
+    def test_defaults_are_none(self):
+        rec = make_record()
+        assert rec.expires_at is None
+        assert rec.refresh_operation is None
+        assert rec.refresh_args is None
+
+    def test_expires_at_with_refresh_operation(self):
+        rec = make_record(
+            expires_at=1234.0, refresh_operation="reembed", refresh_args={"id": "x"}
+        )
+        assert rec.expires_at == 1234.0
+        assert rec.refresh_operation == "reembed"
+        assert rec.refresh_args == {"id": "x"}
+
+    def test_expires_at_without_refresh_operation_is_valid(self):
+        # Flag-only case: a record can be due for attention without an
+        # auto-refresh callback. Must not be rejected.
+        rec = make_record(expires_at=1234.0)
+        assert rec.expires_at == 1234.0
+        assert rec.refresh_operation is None
+
+    def test_refresh_args_must_be_json_serializable(self):
+        with pytest.raises(ValidationError, match="refresh_args"):
+            make_record(refresh_args={"bad": {1, 2, 3}})
+
+    def test_refresh_args_nested_dict_allowed(self):
+        rec = make_record(refresh_args={"nested": {"a": [1, 2]}})
+        assert rec.refresh_args == {"nested": {"a": [1, 2]}}
+
+
 def test_priority_facet_rejects_bool():
     with pytest.raises(ValueError, match="priority"):
         IndexRecord(
