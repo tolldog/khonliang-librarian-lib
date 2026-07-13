@@ -67,6 +67,14 @@ CREATE INDEX IF NOT EXISTS idx_records_project_kind ON records(project, kind);
 CREATE INDEX IF NOT EXISTS idx_records_project_updated ON records(project, updated_at);
 """
 
+#: Created in ``_migrate`` (not ``_SCHEMA``) because it references
+#: ``expires_at``, a column that may not exist yet on a pre-existing file
+#: until the ALTER TABLE statements above it have run.
+_EXPIRY_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_records_project_source_expires "
+    "ON records(project, source, expires_at)"
+)
+
 #: Filter keys that map to real columns rather than facets.
 _COLUMN_FILTERS = {"kind", "record_id", "schema_version", "embedding_status"}
 
@@ -146,6 +154,10 @@ class SelfCatalog:
             conn.execute("ALTER TABLE records ADD COLUMN refresh_operation TEXT")
         if "refresh_args_json" not in existing:
             conn.execute("ALTER TABLE records ADD COLUMN refresh_args_json TEXT")
+        # Safe to (re-)create unconditionally: IF NOT EXISTS, and expires_at
+        # is guaranteed to exist by this point (added just above on legacy
+        # files, or already present in _SCHEMA on a fresh one).
+        conn.execute(_EXPIRY_INDEX_SQL)
 
     # ------------------------------------------------------------------
     # connection hygiene
@@ -172,9 +184,18 @@ class SelfCatalog:
           record arrives with an empty mentions list.
         - Flags links whose ``rel`` is outside the spec vocabulary
           (``unknown_rel=True``) rather than rejecting them.
-        - Stamps the active ``spec.version`` and resets
-          ``embedding_status`` to ``'pending'`` (the text may have changed;
-          re-embedding is the dispatcher's job).
+        - Stamps the active ``spec.version`` on every call, but only resets
+          ``embedding_status`` to ``'pending'`` (and clears the stored
+          vector) when ``text`` actually changed from the existing row —
+          re-embedding is the dispatcher's job, and there is nothing to
+          re-embed when the embeddable text is untouched. This matters for
+          the expiry scheduler fields (``expires_at`` /
+          ``refresh_operation`` / ``refresh_args``): an owner rescheduling
+          a record via ``upsert()`` with the same ``text`` must not pay for
+          a needless re-embed. Facet/link/ref-only changes are likewise
+          embedding-neutral, since the embedding is derived from ``text``
+          alone. A brand new row is always inserted 'pending' (nothing to
+          preserve yet).
         """
         if record.source != self.source:
             raise ValueError(
@@ -217,9 +238,15 @@ class SelfCatalog:
                     ref_json          = excluded.ref_json,
                     updated_at        = excluded.updated_at,
                     spec_version      = excluded.spec_version,
-                    embedding_status  = 'pending',
-                    embedding         = NULL,
-                    embedding_model   = NULL,
+                    embedding_status  = CASE WHEN excluded.text = records.text
+                                             THEN records.embedding_status
+                                             ELSE 'pending' END,
+                    embedding         = CASE WHEN excluded.text = records.text
+                                             THEN records.embedding
+                                             ELSE NULL END,
+                    embedding_model   = CASE WHEN excluded.text = records.text
+                                             THEN records.embedding_model
+                                             ELSE NULL END,
                     expires_at        = excluded.expires_at,
                     refresh_operation = excluded.refresh_operation,
                     refresh_args_json = excluded.refresh_args_json

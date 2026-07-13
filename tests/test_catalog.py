@@ -418,6 +418,102 @@ class TestQuery:
 
 
 class TestExpiryScheduler:
+    def test_upsert_preserves_embedding_when_only_expiry_fields_change(self, catalog):
+        # Rescheduling (expires_at/refresh_operation/refresh_args) must not
+        # force a needless re-embed when the embeddable text is unchanged —
+        # embeddings are derived from `text` alone.
+        catalog.upsert(make_record(record_id="r1", text="stable text"))
+        assert catalog.store_embedding("khonliang", "r1", b"\x01\x02", "test-model") is True
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+
+        catalog.upsert(
+            make_record(record_id="r1", text="stable text", expires_at=999.0,
+                        refresh_operation="reembed", refresh_args={"id": "r1"})
+        )
+        assert catalog.stats("khonliang")["pending_embeddings"] == 0
+        got = catalog.get("khonliang", "r1")
+        assert got.expires_at == 999.0
+        assert got.refresh_operation == "reembed"
+        with catalog._connect() as conn:
+            row = conn.execute(
+                "SELECT embedding, embedding_model, embedding_status FROM records "
+                "WHERE project = ? AND source = ? AND record_id = ?",
+                ("khonliang", "developer", "r1"),
+            ).fetchone()
+        assert row["embedding"] == b"\x01\x02"
+        assert row["embedding_model"] == "test-model"
+        assert row["embedding_status"] == "ready"
+
+    def test_upsert_still_invalidates_embedding_when_text_changes(self, catalog):
+        catalog.upsert(make_record(record_id="r1", text="old text"))
+        catalog.store_embedding("khonliang", "r1", b"\x01\x02", "test-model")
+        catalog.upsert(make_record(record_id="r1", text="new text"))
+        assert catalog.stats("khonliang")["pending_embeddings"] == 1
+        with catalog._connect() as conn:
+            row = conn.execute(
+                "SELECT embedding, embedding_status FROM records "
+                "WHERE project = ? AND source = ? AND record_id = ?",
+                ("khonliang", "developer", "r1"),
+            ).fetchone()
+        assert row["embedding"] is None
+        assert row["embedding_status"] == "pending"
+
+    def test_new_row_always_inserted_pending(self, catalog):
+        catalog.upsert(make_record(record_id="r1"))
+        assert catalog.stats("khonliang")["pending_embeddings"] == 1
+
+    def test_expiry_index_exists(self, catalog):
+        with catalog._connect() as conn:
+            names = {
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
+        assert "idx_records_project_source_expires" in names
+
+    def test_expiry_index_backfilled_on_legacy_db(self, tmp_path):
+        db_path = tmp_path / "legacy_no_index.db"
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE records (
+                    project          TEXT NOT NULL,
+                    source           TEXT NOT NULL,
+                    record_id        TEXT NOT NULL,
+                    schema_version   INTEGER NOT NULL,
+                    kind             TEXT NOT NULL,
+                    facets_json      TEXT NOT NULL DEFAULT '{}',
+                    text             TEXT NOT NULL DEFAULT '',
+                    links_json       TEXT NOT NULL DEFAULT '[]',
+                    mentions_json    TEXT NOT NULL DEFAULT '[]',
+                    ref_json         TEXT NOT NULL DEFAULT '{}',
+                    updated_at       REAL NOT NULL,
+                    spec_version     INTEGER NOT NULL,
+                    embedding_status TEXT NOT NULL DEFAULT 'pending',
+                    embedding        BLOB,
+                    embedding_model  TEXT,
+                    embedding_token  INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (project, source, record_id)
+                );
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        catalog = SelfCatalog(
+            db_path=db_path, source="developer", owner_agent="developer-primary"
+        )
+        with catalog._connect() as conn:
+            names = {
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
+        assert "idx_records_project_source_expires" in names
+
     def test_upsert_roundtrips_expiry_fields(self, catalog):
         catalog.upsert(
             make_record(
