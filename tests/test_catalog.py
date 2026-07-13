@@ -272,6 +272,66 @@ class TestSchemaMigration:
         assert catalog.mark_stale_for_spec_bump("khonliang", make_spec(2)) == 1
         [pending] = catalog.pending_embeddings()
         assert pending["embedding_token"] == 1
+
+    def test_opens_pre_expiry_columns_db_and_backfills_them(self, tmp_path):
+        db_path = tmp_path / "legacy_pre_expiry.db"
+        # Simulate a catalog file created before expires_at/refresh_operation/
+        # refresh_args_json existed (post embedding_token, pre this FR).
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE records (
+                    project          TEXT NOT NULL,
+                    source           TEXT NOT NULL,
+                    record_id        TEXT NOT NULL,
+                    schema_version   INTEGER NOT NULL,
+                    kind             TEXT NOT NULL,
+                    facets_json      TEXT NOT NULL DEFAULT '{}',
+                    text             TEXT NOT NULL DEFAULT '',
+                    links_json       TEXT NOT NULL DEFAULT '[]',
+                    mentions_json    TEXT NOT NULL DEFAULT '[]',
+                    ref_json         TEXT NOT NULL DEFAULT '{}',
+                    updated_at       REAL NOT NULL,
+                    spec_version     INTEGER NOT NULL,
+                    embedding_status TEXT NOT NULL DEFAULT 'pending',
+                    embedding        BLOB,
+                    embedding_model  TEXT,
+                    embedding_token  INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (project, source, record_id)
+                );
+                INSERT INTO records (
+                    project, source, record_id, schema_version, kind,
+                    updated_at, spec_version
+                ) VALUES ('khonliang', 'developer', 'fr_legacy', 1, 'fr', 1.0, 0);
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Opening a SelfCatalog against this pre-existing file must run the
+        # ALTER TABLE branch (not the CREATE TABLE IF NOT EXISTS path, which
+        # only applies to brand-new files) and backfill the three new
+        # columns as NULL rather than raising or dropping the legacy row.
+        catalog = SelfCatalog(
+            db_path=db_path, source="developer", owner_agent="developer-primary"
+        )
+        got = catalog.get("khonliang", "fr_legacy")
+        assert got is not None
+        assert got.expires_at is None
+        assert got.refresh_operation is None
+        assert got.refresh_args is None
+        assert catalog.list_expiring("khonliang", before=1000.0) == {
+            "count": 0,
+            "rows": [],
+        }
+
+        # And the migrated file accepts new writes using the new columns.
+        catalog.upsert(make_record(record_id="fr_new", expires_at=5.0))
+        res = catalog.list_expiring("khonliang", before=1000.0)
+        assert [r["record_id"] for r in res["rows"]] == ["fr_new"]
+
     def test_default_scope_isolates_projects(self, catalog):
         catalog.upsert(make_record(project="proj_a", record_id="r1"))
         catalog.upsert(make_record(project="proj_b", record_id="r2"))

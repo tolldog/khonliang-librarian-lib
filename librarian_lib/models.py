@@ -130,8 +130,9 @@ class IndexRecord(BaseModel):
     #: skill registry here; interpretation is entirely the librarian's
     #: and the owner's problem.
     refresh_operation: Optional[str] = None
-    #: JSON-serializable args to pass to refresh_operation. Must be a flat
-    #: dict when present (mirrors the rigor already applied to facets/ref).
+    #: JSON-serializable args to pass to refresh_operation. Must be a
+    #: dict when present, values may nest, same rigor already applied to
+    #: facets/ref (JSON-serializability, not flatness).
     refresh_args: Optional[dict[str, Any]] = None
 
     @field_validator("refresh_args")
