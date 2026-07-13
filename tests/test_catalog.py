@@ -357,6 +357,93 @@ class TestQuery:
         assert [r["record_id"] for r in res["rows"]] == ["bug_1", "fr_2"]
 
 
+class TestExpiryScheduler:
+    def test_upsert_roundtrips_expiry_fields(self, catalog):
+        catalog.upsert(
+            make_record(
+                record_id="r1",
+                expires_at=500.0,
+                refresh_operation="reembed",
+                refresh_args={"id": "r1", "n": 2},
+            )
+        )
+        got = catalog.get("khonliang", "r1")
+        assert got.expires_at == 500.0
+        assert got.refresh_operation == "reembed"
+        assert got.refresh_args == {"id": "r1", "n": 2}
+
+    def test_upsert_roundtrips_flag_only_case(self, catalog):
+        # expires_at set, refresh_operation left None — must round-trip
+        # exactly, not be coerced or dropped.
+        catalog.upsert(make_record(record_id="r1", expires_at=500.0))
+        got = catalog.get("khonliang", "r1")
+        assert got.expires_at == 500.0
+        assert got.refresh_operation is None
+        assert got.refresh_args is None
+
+    def test_upsert_defaults_omitted_fields_to_none(self, catalog):
+        catalog.upsert(make_record(record_id="r1"))
+        got = catalog.get("khonliang", "r1")
+        assert got.expires_at is None
+        assert got.refresh_operation is None
+        assert got.refresh_args is None
+
+    def test_list_expiring_empty_when_nothing_due(self, catalog):
+        catalog.upsert(make_record(record_id="r1"))
+        catalog.upsert(make_record(record_id="r2", expires_at=1000.0))
+        res = catalog.list_expiring("khonliang", before=500.0)
+        assert res == {"count": 0, "rows": []}
+
+    def test_list_expiring_excludes_none_expires_at(self, catalog):
+        catalog.upsert(make_record(record_id="r1"))  # expires_at=None
+        catalog.upsert(make_record(record_id="r2", expires_at=100.0))
+        res = catalog.list_expiring("khonliang", before=1000.0)
+        assert [r["record_id"] for r in res["rows"]] == ["r2"]
+
+    def test_list_expiring_ascending_most_overdue_first(self, catalog):
+        catalog.upsert(make_record(record_id="r1", expires_at=300.0))
+        catalog.upsert(make_record(record_id="r2", expires_at=100.0))
+        catalog.upsert(make_record(record_id="r3", expires_at=200.0))
+        res = catalog.list_expiring("khonliang", before=1000.0)
+        assert [r["record_id"] for r in res["rows"]] == ["r2", "r3", "r1"]
+
+    def test_list_expiring_includes_flag_only_rows(self, catalog):
+        # expires_at set but refresh_operation=None must NOT be dropped.
+        catalog.upsert(make_record(record_id="r1", expires_at=100.0))
+        res = catalog.list_expiring("khonliang", before=1000.0)
+        assert res["count"] == 1
+        assert res["rows"][0]["refresh_operation"] is None
+
+    def test_list_expiring_scoped_to_project(self, catalog):
+        catalog.upsert(make_record(project="proj_a", record_id="r1", expires_at=100.0))
+        catalog.upsert(make_record(project="proj_b", record_id="r2", expires_at=100.0))
+        res = catalog.list_expiring("proj_a", before=1000.0)
+        assert [r["project"] for r in res["rows"]] == ["proj_a"]
+
+    def test_list_expiring_scoped_to_source(self, catalog, tmp_path):
+        other = SelfCatalog(
+            db_path=tmp_path / "other.db", source="researcher", owner_agent="researcher-primary"
+        )
+        catalog.upsert(make_record(record_id="r1", expires_at=100.0))
+        other.upsert(
+            make_record(source="researcher", record_id="r2", expires_at=100.0)
+        )
+        res = catalog.list_expiring("khonliang", before=1000.0)
+        assert [r["record_id"] for r in res["rows"]] == ["r1"]
+
+    def test_list_expiring_boundary_inclusive(self, catalog):
+        catalog.upsert(make_record(record_id="r1", expires_at=100.0))
+        res = catalog.list_expiring("khonliang", before=100.0)
+        assert res["count"] == 1
+
+    def test_list_expiring_respects_limit(self, catalog):
+        for i in range(5):
+            catalog.upsert(make_record(record_id=f"r{i}", expires_at=float(i)))
+        res = catalog.list_expiring("khonliang", before=1000.0, limit=2)
+        assert res["count"] == 2
+        assert [r["record_id"] for r in res["rows"]] == ["r0", "r1"]
+
+
 class TestSearchAndSync:
     def test_text_fallback_mode_without_vector(self, catalog):
         catalog.upsert(make_record(record_id="r1", text="catalog federation design"))
@@ -435,6 +522,7 @@ class TestConnectionHygiene:
             catalog.search("khonliang", "catalog")
             catalog.stats("khonliang")
             catalog.list_since("khonliang", 0.0)
+            catalog.list_expiring("khonliang", 0.0)
             catalog.pending_embeddings()
             catalog.store_embedding("khonliang", "fr_deadbeef", b"\x00", "m")
             catalog.delete("khonliang", "fr_deadbeef")

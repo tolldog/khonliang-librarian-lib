@@ -58,6 +58,9 @@ CREATE TABLE IF NOT EXISTS records (
     embedding        BLOB,
     embedding_model  TEXT,
     embedding_token  INTEGER NOT NULL DEFAULT 0,
+    expires_at       REAL,
+    refresh_operation TEXT,
+    refresh_args_json TEXT,
     PRIMARY KEY (project, source, record_id)
 );
 CREATE INDEX IF NOT EXISTS idx_records_project_kind ON records(project, kind);
@@ -137,6 +140,12 @@ class SelfCatalog:
             conn.execute(
                 "ALTER TABLE records ADD COLUMN embedding_token INTEGER NOT NULL DEFAULT 0"
             )
+        if "expires_at" not in existing:
+            conn.execute("ALTER TABLE records ADD COLUMN expires_at REAL")
+        if "refresh_operation" not in existing:
+            conn.execute("ALTER TABLE records ADD COLUMN refresh_operation TEXT")
+        if "refresh_args_json" not in existing:
+            conn.execute("ALTER TABLE records ADD COLUMN refresh_args_json TEXT")
 
     # ------------------------------------------------------------------
     # connection hygiene
@@ -178,10 +187,15 @@ class SelfCatalog:
         try:
             facets_json = json.dumps(record.facets, allow_nan=False)
             ref_json = json.dumps(record.ref, allow_nan=False)
+            refresh_args_json = (
+                json.dumps(record.refresh_args, allow_nan=False)
+                if record.refresh_args is not None
+                else None
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"IndexRecord {record.record_id!r}: facets and ref must be "
-                f"JSON-serializable ({exc})"
+                f"IndexRecord {record.record_id!r}: facets, ref, and "
+                f"refresh_args must be JSON-serializable ({exc})"
             ) from exc
         with self._connect() as conn:
             conn.execute(
@@ -190,21 +204,25 @@ class SelfCatalog:
                     project, source, record_id, schema_version, kind,
                     facets_json, text, links_json, mentions_json, ref_json,
                     updated_at, spec_version, embedding_status, embedding,
-                    embedding_model
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL)
+                    embedding_model, expires_at, refresh_operation,
+                    refresh_args_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, ?, ?)
                 ON CONFLICT(project, source, record_id) DO UPDATE SET
-                    schema_version   = excluded.schema_version,
-                    kind             = excluded.kind,
-                    facets_json      = excluded.facets_json,
-                    text             = excluded.text,
-                    links_json       = excluded.links_json,
-                    mentions_json    = excluded.mentions_json,
-                    ref_json         = excluded.ref_json,
-                    updated_at       = excluded.updated_at,
-                    spec_version     = excluded.spec_version,
-                    embedding_status = 'pending',
-                    embedding        = NULL,
-                    embedding_model  = NULL
+                    schema_version    = excluded.schema_version,
+                    kind              = excluded.kind,
+                    facets_json       = excluded.facets_json,
+                    text              = excluded.text,
+                    links_json        = excluded.links_json,
+                    mentions_json     = excluded.mentions_json,
+                    ref_json          = excluded.ref_json,
+                    updated_at        = excluded.updated_at,
+                    spec_version      = excluded.spec_version,
+                    embedding_status  = 'pending',
+                    embedding         = NULL,
+                    embedding_model   = NULL,
+                    expires_at        = excluded.expires_at,
+                    refresh_operation = excluded.refresh_operation,
+                    refresh_args_json = excluded.refresh_args_json
                 """,
                 (
                     record.project,
@@ -219,6 +237,9 @@ class SelfCatalog:
                     ref_json,
                     updated_at,
                     self.spec.version,
+                    record.expires_at,
+                    record.refresh_operation,
+                    refresh_args_json,
                 ),
             )
             conn.commit()
@@ -567,6 +588,54 @@ class SelfCatalog:
             ]
         return {"count": len(rows), "rows": rows}
 
+    def list_expiring(
+        self, project: str, before: float, limit: int = 100
+    ) -> dict[str, Any]:
+        """This source's records whose ``expires_at`` is due, most overdue first.
+
+        Generic per-record scheduler: any owner agent can stamp an
+        ``IndexRecord`` with ``expires_at`` (absolute epoch seconds) and an
+        optional ``refresh_operation``/``refresh_args`` naming a skill on
+        its own ``owner_agent`` for the librarian to call. This library
+        never interprets what "refresh" means — it only stores the flag
+        and answers "what's due".
+
+        Rows with ``expires_at IS NULL`` never match (they were never
+        flagged). Rows with ``expires_at`` set but ``refresh_operation``
+        left ``None`` are a valid "flag only, no auto-refresh" case and
+        ARE included — the caller (librarian) decides what to do with a
+        record that has no callback.
+
+        This method name/args/response shape is a fixed cross-repo
+        contract: the librarian agent's ``run_expiry_sweep`` (a sibling
+        FR, built in parallel) calls exactly ``catalog_list_expiring``
+        (the bus-skill wrapper in ``skills.py``) with ``project, before,
+        limit`` and expects ``{"count": int, "rows": [...]}`` — do not
+        rename or reshape without coordinating there first.
+
+        Args:
+            project: project scope (mandatory; isolation is load-bearing).
+            before: absolute epoch seconds cutoff — rows with
+                ``expires_at <= before`` are due.
+            limit: max rows (default 100).
+
+        Returns:
+            ``{"count": int, "rows": [...]}``, ``rows`` ordered by
+            ``expires_at`` ascending (most overdue first).
+        """
+        with self._connect() as conn:
+            rows = [
+                _row_to_dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM records "
+                    "WHERE project = ? AND source = ? "
+                    "AND expires_at IS NOT NULL AND expires_at <= ? "
+                    "ORDER BY expires_at ASC LIMIT ?",
+                    (project, self.source, float(before), int(limit)),
+                ).fetchall()
+            ]
+        return {"count": len(rows), "rows": rows}
+
     # ------------------------------------------------------------------
     # embedding backlog (stub-then-swap: generation happens elsewhere)
     # ------------------------------------------------------------------
@@ -664,6 +733,13 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "updated_at": row["updated_at"],
         "spec_version": row["spec_version"],
         "embedding_status": row["embedding_status"],
+        "expires_at": row["expires_at"],
+        "refresh_operation": row["refresh_operation"],
+        "refresh_args": (
+            json.loads(row["refresh_args_json"])
+            if row["refresh_args_json"] is not None
+            else None
+        ),
     }
 
 
@@ -681,4 +757,7 @@ def _row_to_record(row: sqlite3.Row) -> IndexRecord:
         links=[Link(**link) for link in d["links"]],
         mentions=d["mentions"],
         ref=d["ref"],
+        expires_at=d["expires_at"],
+        refresh_operation=d["refresh_operation"],
+        refresh_args=d["refresh_args"],
     )

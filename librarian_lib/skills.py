@@ -113,6 +113,36 @@ class CatalogSkills:
         """
         return self.catalog.list_since(project, since_ts, limit=limit)
 
+    def catalog_list_expiring(
+        self, project: str, before: float, limit: int = 100
+    ) -> dict[str, Any]:
+        """This source's records due for refresh, most overdue first.
+
+        Generic per-record scheduler surface: any owner agent stamps an
+        ``IndexRecord`` with ``expires_at`` (absolute epoch seconds) and
+        an optional ``refresh_operation``/``refresh_args`` naming a skill
+        on itself for the librarian to call back. This library never
+        interprets what "refresh" means — pure storage + query.
+
+        Rows with ``expires_at`` set but ``refresh_operation`` left
+        ``None`` are included (a valid flag-only case, never dropped).
+
+        FIXED CONTRACT: name, args (project, before, limit), and response
+        shape ({"count", "rows"}) are relied on by the librarian agent's
+        ``run_expiry_sweep`` (a sibling FR built in parallel) — do not
+        rename or reshape.
+
+        Args:
+            project: project scope (mandatory; isolation is load-bearing).
+            before: absolute epoch seconds cutoff; rows with
+                ``expires_at <= before`` are due.
+            limit: max rows (default 100).
+
+        Returns:
+            {"count": int, "rows": [...]} ordered by expires_at ascending.
+        """
+        return self.catalog.list_expiring(project, before, limit=limit)
+
     def catalog_mark_stale(self, project: str, spec: dict[str, Any]) -> dict[str, Any]:
         """Bulk-flag this source's records pending re-embedding after a spec bump.
 
